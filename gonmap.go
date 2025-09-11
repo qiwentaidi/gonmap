@@ -177,9 +177,9 @@ func FixProtocol(oldProtocol string) string {
 	if oldProtocol == "ssl/http" {
 		return "https"
 	}
-	if oldProtocol == "http-proxy" {
-		return "http"
-	}
+	// if oldProtocol == "http-proxy" {
+	// 	return "http"
+	// }
 	if oldProtocol == "ms-wbt-server" {
 		return "rdp"
 	}
