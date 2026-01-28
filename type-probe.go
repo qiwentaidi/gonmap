@@ -136,12 +136,57 @@ func (p *probe) loadProbe(s string) {
 	p.protocol = args[1]
 	p.name = args[1] + "_" + args[2]
 	str := args[3]
-	str = strings.ReplaceAll(str, `\0`, `\x00`)
-	str = strings.ReplaceAll(str, `"`, `${double-quoted}`)
-	str = `"` + str + `"`
-	str, _ = strconv.Unquote(str)
-	str = strings.ReplaceAll(str, `${double-quoted}`, `"`)
-	p.sendRaw = str
+
+	// 手动解析十六进制转义序列，避免 strconv.Unquote 对 \x00 的处理问题
+	var result strings.Builder
+	i := 0
+	for i < len(str) {
+
+		if i+3 < len(str) && str[i:i+2] == `\x` {
+			// 解析 \xHH 格式
+			hexStr := str[i+2 : i+4]
+			var b byte
+			if _, err := fmt.Sscanf(hexStr, "%02x", &b); err == nil {
+				result.WriteByte(b)
+				i += 4
+				continue
+			}
+		} else if i+1 < len(str) && str[i:i+2] == `\0` {
+			// 解析 \0
+			result.WriteByte(0)
+			i += 2
+			continue
+		} else if i+1 < len(str) && str[i] == '\\' {
+			// 其他转义字符
+			switch str[i+1] {
+			case 'n':
+				result.WriteByte('\n')
+				i += 2
+				continue
+			case 'r':
+				result.WriteByte('\r')
+				i += 2
+				continue
+			case 't':
+				result.WriteByte('\t')
+				i += 2
+				continue
+			case '\\':
+				result.WriteByte('\\')
+				i += 2
+				continue
+			case '"':
+				result.WriteByte('"')
+				i += 2
+				continue
+			}
+		}
+		// 普通字符
+		result.WriteByte(str[i])
+		i++
+	}
+
+	p.sendRaw = result.String()
 }
 
 func (p *probe) loadMatch(s string, soft bool) {

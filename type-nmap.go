@@ -98,6 +98,7 @@ func (n *Nmap) getResponseByProbes(host string, port int, timeout time.Duration,
 		p := n.probeNameMap[requestName]
 
 		status, response = n.getResponse(host, port, arrayutil.ArrayContains(port, p.sslports), timeout, p, proxyURL)
+
 		//如果端口未开放，则等待10s后重新连接
 		//if b.status == Closed {
 		//	time.Sleep(time.Second * 10)
@@ -336,6 +337,13 @@ func (n *Nmap) sortOfRarity(list []string) []string {
 	}
 
 	return list
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // 工具函数
