@@ -1,6 +1,7 @@
 package simplenet
 
 import (
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -8,10 +9,74 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
 )
+
+type deadlineConn interface {
+	io.ReadWriteCloser
+	SetReadDeadline(time.Time) error
+}
+
+var readChunkPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 256)
+		return &buf
+	},
+}
+
+var responseBufferPool = sync.Pool{
+	New: func() any {
+		return &bytes.Buffer{}
+	},
+}
+
+func readResponse(conn deadlineConn, size int, allowEarlyBreak bool) (string, error) {
+	tmpPtr := readChunkPool.Get().(*[]byte)
+	tmp := *tmpPtr
+	defer readChunkPool.Put(tmpPtr)
+
+	buf := responseBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if size > 0 {
+		buf.Grow(min(size, 4096))
+	}
+	defer responseBufferPool.Put(buf)
+
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		length, err := conn.Read(tmp)
+		if length > 0 {
+			_, _ = buf.Write(tmp[:length])
+		}
+		if allowEarlyBreak && length < len(tmp) {
+			break
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return "", errors.New(err.Error() + " STEP3:READ")
+		}
+		if size > 0 && buf.Len() > size {
+			break
+		}
+	}
+
+	if buf.Len() == 0 {
+		return "", errors.New("STEP3:response is empty")
+	}
+	return buf.String(), nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 // netloc 主机地址
 func tcpSend(protocol string, netloc string, data string, duration time.Duration, size int) (string, error) {
@@ -26,32 +91,9 @@ func tcpSend(protocol string, netloc string, data string, duration time.Duration
 	if err != nil {
 		return "", errors.New(err.Error() + " STEP2:WRITE")
 	}
-	//读取数据
-	var buf []byte              // big buffer
-	var tmp = make([]byte, 256) // using small tmo buffer for demonstrating
-	var length int
-	for {
-		//设置读取超时Deadline
-		_ = conn.SetReadDeadline(time.Now().Add(time.Second * 3))
-		length, err = conn.Read(tmp)
-		buf = append(buf, tmp[:length]...)
-		if length < len(tmp) {
-			break
-		}
-		if err != nil {
-			break
-		}
-		if len(buf) > size {
-			break
-		}
-	}
-	if err != nil && err != io.EOF {
-		return "", errors.New(err.Error() + " STEP3:READ")
-	}
-	if len(buf) == 0 {
-		return "", errors.New("STEP3:response is empty")
-	}
-	return string(buf), nil
+	// 设计权衡：当读取量小于缓冲区时提前退出，以加快扫描速度。
+	// 这在大多数请求-响应协议中工作良好，但对分包传输可能截断响应。
+	return readResponse(conn, size, true)
 }
 
 func tcpSendWithProxy(protocol string, netloc string, data string, duration time.Duration, size int, socksAddress string, auth *proxy.Auth) (string, error) {
@@ -75,32 +117,7 @@ func tcpSendWithProxy(protocol string, netloc string, data string, duration time
 	if err != nil {
 		return "", errors.New(err.Error() + " STEP2:WRITE")
 	}
-	//读取数据
-	var buf []byte              // big buffer
-	var tmp = make([]byte, 256) // using small tmo buffer for demonstrating
-	var length int
-	for {
-		//设置读取超时Deadline
-		_ = conn.SetReadDeadline(time.Now().Add(time.Second * 3))
-		length, err = conn.Read(tmp)
-		buf = append(buf, tmp[:length]...)
-		if length < len(tmp) {
-			break
-		}
-		if err != nil {
-			break
-		}
-		if len(buf) > size {
-			break
-		}
-	}
-	if err != nil && err != io.EOF {
-		return "", errors.New(err.Error() + " STEP3:READ")
-	}
-	if len(buf) == 0 {
-		return "", errors.New("STEP3:response is empty")
-	}
-	return string(buf), nil
+	return readResponse(conn, size, true)
 }
 
 // tlsSend函数用于发送TLS请求
@@ -128,32 +145,8 @@ func tlsSend(protocol string, netloc string, data string, duration time.Duration
 	if err != nil {
 		return "", errors.New(err.Error() + " STEP2:WRITE")
 	}
-	// 读取数据
-	var buf []byte              // big buffer
-	var tmp = make([]byte, 256) // using small tmo buffer for demonstrating
-	var length int
-	for {
-		// 设置读取超时Deadline
-		_ = conn.SetReadDeadline(time.Now().Add(time.Second * 3))
-		length, err = conn.Read(tmp)
-		buf = append(buf, tmp[:length]...)
-		// if length < len(tmp) {
-		// 	break
-		// }
-		if err != nil {
-			break
-		}
-		if len(buf) > size {
-			break
-		}
-	}
-	if err != nil && err != io.EOF {
-		return "", errors.New(err.Error() + " STEP3:READ")
-	}
-	if len(buf) == 0 {
-		return "", errors.New("STEP3:response is empty")
-	}
-	return string(buf), nil
+	// TLS 版本不使用 early break，因为 TLS 记录可能分多次到达。
+	return readResponse(conn, size, false)
 }
 
 func tlsSendWithProxy(protocol string, netloc string, data string, duration time.Duration, size int, socksAddress string, auth *proxy.Auth) (string, error) {
@@ -194,50 +187,33 @@ func tlsSendWithProxy(protocol string, netloc string, data string, duration time
 	if err != nil {
 		return "", fmt.Errorf("failed to send data: %w", err)
 	}
-
-	// 读取数据
-	var buf []byte              // large buffer
-	var tmp = make([]byte, 256) // small temporary buffer
-	var length int
-	for {
-		// 设置超时
-		_ = tlsConn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		length, err = tlsConn.Read(tmp)
-		buf = append(buf, tmp[:length]...)
-		if length < len(tmp) {
-			break
-		}
-		if err != nil {
-			break
-		}
-		if len(buf) > size {
-			break
-		}
+	text, err := readResponse(tlsConn, size, false)
+	if err != nil {
+		return "", err
 	}
-	if err != nil && err != io.EOF {
-		return "", fmt.Errorf("failed to read response: %w", err)
-	}
-	if len(buf) == 0 {
-		return "", errors.New("response is empty")
-	}
-
-	return string(buf), nil
+	return text, nil
 }
 
 func Send(protocol string, tls bool, netloc string, data string, duration time.Duration, size int, proxyURL string) (string, error) {
+	protocol = strings.ToLower(protocol)
 	if proxyURL != "" {
+		if protocol == "udp" {
+			return "", errors.New("SOCKS5 proxy for UDP is not supported")
+		}
 		u, err := url.Parse(proxyURL)
 		if err != nil {
 			return "", fmt.Errorf("failed to parse proxy URL: %w", err)
 		}
+		var auth *proxy.Auth
 		if u.User != nil {
 			username := u.User.Username()
 			password, _ := u.User.Password()
-			if tls {
-				return tlsSendWithProxy(protocol, netloc, data, duration, size, u.Host, &proxy.Auth{User: username, Password: password})
-			} else {
-				return tcpSendWithProxy(protocol, netloc, data, duration, size, u.Host, &proxy.Auth{User: username, Password: password})
-			}
+			auth = &proxy.Auth{User: username, Password: password}
+		}
+		if tls {
+			return tlsSendWithProxy(protocol, netloc, data, duration, size, u.Host, auth)
+		} else {
+			return tcpSendWithProxy(protocol, netloc, data, duration, size, u.Host, auth)
 		}
 	}
 	if tls {

@@ -3,7 +3,6 @@ package gonmap
 import (
 	"regexp"
 	"strings"
-	"time"
 )
 
 var nmap *Nmap
@@ -27,10 +26,13 @@ func initWithFilter(filter int) {
 		probeSort:    []string{},
 		portProbeMap: make(map[int][]string),
 
-		filter:  filter,
-		timeout: time.Second,
+		filter: filter,
+		defaultScanOptions: ScanOptions{
+			Timeout:  defaultScanTimeout,
+			ReadSize: defaultReadSize,
+			Protocol: ScanProtocolAuto,
+		},
 
-		probeUsed:          []string{},
 		bypassAllProbePort: []int{161, 137, 139, 135, 389, 443, 548, 1433, 6379, 1883, 5432, 1521, 3389, 3388, 3389, 33890, 33900, 5236},
 		sslSecondProbeMap:  []string{"TCP_TerminalServerCookie", "TCP_TerminalServer"},
 		allProbeMap:        []string{"TCP_GetRequest", "TCP_NULL", "TCP_redis-server", "TCP_ms-sql-s"},
@@ -58,6 +60,10 @@ func initWithFilter(filter int) {
 }
 
 func statistical() {
+	ProbesCount = 0
+	MatchCount = 0
+	UsedProbesCount = 0
+	UsedMatchCount = 0
 	ProbesCount = len(nmap.probeSort)
 	for _, p := range nmap.probeNameMap {
 		MatchCount += len(p.matchGroup)
@@ -164,8 +170,6 @@ func SetFilter(filter int) {
 // 功能类
 func New() *Nmap {
 	n := *nmap
-	// 重置 probeUsed，避免不同实例之间互相影响
-	n.probeUsed = []string{}
 	return &n
 }
 

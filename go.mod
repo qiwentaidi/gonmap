@@ -4,6 +4,7 @@ go 1.23.0
 
 require (
 	github.com/miekg/dns v1.1.68
+	github.com/panjf2000/ants v1.3.0
 	github.com/qiwentaidi/utils v0.0.2
 	golang.org/x/net v0.43.0
 )

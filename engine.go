@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
-	arrayutil "github.com/qiwentaidi/utils/array"
 )
 
 // Open 是端口开放，没有返回报文，没识别出协议
@@ -19,12 +18,8 @@ type Nmap struct {
 	probeNameMap map[string]*probe
 	probeSort    []string
 
-	probeUsed []string
-
-	filter int
-
-	//检测端口存活的超时时间
-	timeout time.Duration
+	filter             int
+	defaultScanOptions ScanOptions
 
 	bypassAllProbePort []int
 	sslSecondProbeMap  []string
@@ -35,128 +30,15 @@ type Nmap struct {
 //扫描类
 
 func (n *Nmap) Scan(ip string, port int, timeout time.Duration, proxyURL string) (status Status, response *Response) {
-	n.timeout = timeout
-	var probeNames []string
-	if arrayutil.ArrayContains(port, n.bypassAllProbePort) {
-		probeNames = append(n.portProbeMap[port], n.allProbeMap...)
-	} else {
-		probeNames = append(n.allProbeMap, n.portProbeMap[port]...)
-	}
-	probeNames = append(probeNames, n.sslProbeMap...)
-	//探针去重
-	probeNames = arrayutil.RemoveDuplicates(probeNames)
-
-	firstProbe := probeNames[0]
-	status, response = n.getRealResponse(ip, port, n.timeout, proxyURL, firstProbe)
-	if status == Closed || status == Matched {
-		return status, response
-	}
-	otherProbes := probeNames[1:]
-	return n.getRealResponse(ip, port, n.timeout, proxyURL, otherProbes...)
+	return n.ScanWithOptions(ip, port, &ScanOptions{
+		Timeout:  timeout,
+		ProxyURL: proxyURL,
+	})
 }
 
-func (n *Nmap) getRealResponse(host string, port int, timeout time.Duration, proxyURL string, probes ...string) (status Status, response *Response) {
-	status, response = n.getResponseByProbes(host, port, timeout, proxyURL, probes...)
-	if status != Matched {
-		return status, response
-	}
-	if response.FingerPrint.Service == "ssl" {
-		status, response := n.getResponseBySSLSecondProbes(host, port, timeout, proxyURL)
-		if status == Matched {
-			return Matched, response
-		}
-	}
-	return status, response
-}
-
-func (n *Nmap) getResponseBySSLSecondProbes(host string, port int, timeout time.Duration, proxyURL string) (status Status, response *Response) {
-	status, response = n.getResponseByProbes(host, port, timeout, proxyURL, n.sslSecondProbeMap...)
-	if status != Matched || response.FingerPrint.Service == "ssl" {
-		status, response = n.getResponseByHTTPS(host, port, timeout, proxyURL)
-	}
-	if status == Matched && response.FingerPrint.Service != "ssl" {
-		if response.FingerPrint.Service == "http" {
-			response.FingerPrint.Service = "https"
-		}
-		return Matched, response
-	}
-	return NotMatched, response
-}
-
-func (n *Nmap) getResponseByHTTPS(host string, port int, timeout time.Duration, proxyURL string) (status Status, response *Response) {
-	var httpRequest = n.probeNameMap["TCP_GetRequest"]
-	return n.getResponse(host, port, true, timeout, httpRequest, proxyURL)
-}
-
-func (n *Nmap) getResponseByProbes(host string, port int, timeout time.Duration, proxyURL string, probes ...string) (status Status, response *Response) {
-	var responseNotMatch *Response
-	for _, requestName := range probes {
-		if arrayutil.ArrayContains(requestName, n.probeUsed) {
-			continue
-		}
-		n.probeUsed = append(n.probeUsed, requestName)
-		p := n.probeNameMap[requestName]
-
-		status, response = n.getResponse(host, port, arrayutil.ArrayContains(port, p.sslports), timeout, p, proxyURL)
-
-		//如果端口未开放，则等待10s后重新连接
-		//if b.status == Closed {
-		//	time.Sleep(time.Second * 10)
-		//	b.Load(n.getResponse(host, port, n.probeNameMap[requestName]))
-		//}
-
-		//logger.Printf("Target:%s:%d,Probe:%s,Status:%v", host, port, requestName, status)
-		if status == Closed || status == Matched {
-			responseNotMatch = nil
-			break
-		}
-		if status == NotMatched {
-			responseNotMatch = response
-		}
-	}
-	if responseNotMatch != nil {
-		response = responseNotMatch
-	}
-	return status, response
-}
-
-func (n *Nmap) getResponse(host string, port int, tls bool, timeout time.Duration, p *probe, proxyURL string) (Status, *Response) {
-	if port == 53 {
-		if DnsScan(host, port) {
-			return Matched, &dnsResponse
-		} else {
-			return Closed, nil
-		}
-	}
-	text, tls, err := p.scan(host, port, tls, timeout, 10240, proxyURL)
-	if err != nil {
-		if strings.Contains(err.Error(), "STEP1") {
-			return Closed, nil
-		}
-		if strings.Contains(err.Error(), "STEP2") {
-			return Closed, nil
-		}
-		if p.protocol == "UDP" && strings.Contains(err.Error(), "refused") {
-			return Closed, nil
-		}
-		return Open, nil
-	}
-
-	response := &Response{
-		Raw:         text,
-		TLS:         tls,
-		FingerPrint: &FingerPrint{},
-	}
-	//若存在返回包，则开始捕获指纹
-	fingerPrint := n.getFinger(text, tls, p.name)
-	response.FingerPrint = fingerPrint
-
-	if fingerPrint.Service == "" {
-		return NotMatched, response
-	} else {
-		return Matched, response
-	}
-	//如果成功匹配指纹，则直接返回指纹
+func (n *Nmap) ScanWithOptions(ip string, port int, options *ScanOptions) (status Status, response *Response) {
+	scanOptions := n.normalizeScanOptions(options)
+	return newScanSession(n, ip, port, scanOptions).scan()
 }
 
 func (n *Nmap) getFinger(responseRaw string, tls bool, requestName string) *FingerPrint {
@@ -194,20 +76,18 @@ func (n *Nmap) getFinger(responseRaw string, tls bool, requestName string) *Fing
 
 func (n *Nmap) convResponse(s1 string) string {
 	//为了适配go语言的沙雕正则，只能讲二进制强行转换成UTF-8
-	b1 := []byte(s1)
-	var r1 []rune
-	for _, i := range b1 {
-		r1 = append(r1, rune(i))
+	var builder strings.Builder
+	builder.Grow(len(s1))
+	for i := 0; i < len(s1); i++ {
+		builder.WriteRune(rune(s1[i]))
 	}
-	s2 := string(r1)
-	return s2
+	return builder.String()
 }
 
 //配置类
 
 func (n *Nmap) OpenDeepIdentify() {
-	//-sV参数深度解析
-	n.allProbeMap = n.probeSort
+	n.defaultScanOptions.DeepIdentify = true
 }
 
 func (n *Nmap) AddMatch(probeName string, expr string) {

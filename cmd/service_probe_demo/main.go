@@ -4,15 +4,18 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/qiwentaidi/gonmap"
+	"github.com/qiwentaidi/gonmap/lib"
 )
 
 func main() {
-	engine := gonmap.New()
+	sdk := lib.New(&lib.Options{
+		Timeout:  60 * time.Second,
+		Protocol: lib.ScanProtocolTCP,
+	})
 	fmt.Println("Testing Dameng Database Detection on 139.199.81.233:5236")
-	fmt.Println("Using 60 seconds timeout...")
+	fmt.Println("Using SDK default timeout: 60 seconds...")
 
-	status, resp := engine.Scan("139.199.81.233", 5236, time.Second*60, "")
+	status, resp := sdk.Scan("139.199.81.233", 5236, nil)
 	fmt.Printf("Status: %v\n", status)
 
 	if resp == nil {
