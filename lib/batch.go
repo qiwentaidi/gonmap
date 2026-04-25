@@ -2,6 +2,7 @@ package lib
 
 import (
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -11,6 +12,7 @@ const (
 	defaultSuspiciousOpenThreshold   = 128
 	defaultSuspiciousHighPortStart   = 10000
 	defaultSuspiciousOpenRatio       = 0.60
+	minRepeatedHTTPNoisePorts        = 3
 )
 
 type BatchScanOptions struct {
@@ -182,10 +184,14 @@ func (s *SDK) identifyOpenPorts(groupedOpen map[string][]int, options normalized
 func analyzeHostBatchResult(host string, openPorts []int, results []BatchPortResult, options normalizedBatchScanOptions) HostBatchResult {
 	analyzed := make([]BatchPortResult, len(results))
 	copy(analyzed, results)
+	repeatedHTTPNoiseReasons := detectRepeatedHTTPNoiseReasons(analyzed, options)
 
 	suspiciousCount := 0
 	for index := range analyzed {
-		reason := detectSuspiciousReason(analyzed[index], options)
+		reason := repeatedHTTPNoiseReasons[analyzed[index].Port]
+		if reason == "" {
+			reason = detectSuspiciousReason(analyzed[index], options)
+		}
 		if reason == "" {
 			wrappedReason := detectWrappedReason(analyzed[index], options)
 			if wrappedReason == "" {
@@ -234,13 +240,13 @@ func detectSuspiciousReason(result BatchPortResult, options normalizedBatchScanO
 	if result.Port < options.suspiciousHighPortStart {
 		return ""
 	}
-	if result.Status != Open {
-		return ""
+	if reason := detectGenericOpenReason(result); reason != "" {
+		return reason
 	}
-	if result.Response != nil && result.Response.Raw != "" {
-		return ""
+	if reason := detectGenericHTTPReason(result); reason != "" {
+		return reason
 	}
-	return "generic open without fingerprint on high port"
+	return ""
 }
 
 func detectWrappedReason(result BatchPortResult, options normalizedBatchScanOptions) string {
@@ -263,4 +269,229 @@ func detectWrappedReason(result BatchPortResult, options normalizedBatchScanOpti
 	default:
 		return ""
 	}
+}
+
+func detectGenericOpenReason(result BatchPortResult) string {
+	if result.Status != Open && result.Status != NotMatched {
+		return ""
+	}
+	if result.Response == nil {
+		return "generic open without fingerprint on high port"
+	}
+	if result.Response.Raw != "" {
+		return ""
+	}
+	if hasUsefulFingerprintMetadata(result.Response.FingerPrint) {
+		return ""
+	}
+	return "generic open without fingerprint on high port"
+}
+
+func detectGenericHTTPReason(result BatchPortResult) string {
+	if result.Status != Matched || result.Response == nil || result.Response.Raw == "" {
+		return ""
+	}
+	fingerprint := result.Response.FingerPrint
+	if fingerprint == nil {
+		return ""
+	}
+	if hasStrongFingerprintMetadata(fingerprint) {
+		return ""
+	}
+	if fingerprint.ProductName != "" && !isGenericHTTPProduct(fingerprint.ProductName) {
+		return ""
+	}
+	switch fingerprint.Service {
+	case "http", "ssl/http", "http-proxy":
+	default:
+		return ""
+	}
+
+	raw := strings.ToLower(result.Response.Raw)
+	if !strings.Contains(raw, "server: tengine") {
+		return ""
+	}
+	if extractHTTPStatusCode(raw) == 410 {
+		return ""
+	}
+	for _, marker := range []string{
+		" 400 ",
+		" 401 ",
+		" 403 ",
+		" 404 ",
+		" 405 ",
+		" 408 ",
+		" 410 ",
+		" 421 ",
+		" 429 ",
+		" 500 ",
+		" 501 ",
+		" 502 ",
+		" 503 ",
+		" 504 ",
+	} {
+		if strings.Contains(raw, marker) {
+			return "generic http edge response on high port"
+		}
+	}
+	return ""
+}
+
+func hasUsefulFingerprintMetadata(fingerprint *FingerPrint) bool {
+	if fingerprint == nil {
+		return false
+	}
+	if hasStrongFingerprintMetadata(fingerprint) {
+		return true
+	}
+	return fingerprint.ProductName != ""
+}
+
+func hasStrongFingerprintMetadata(fingerprint *FingerPrint) bool {
+	if fingerprint == nil {
+		return false
+	}
+	return normalizeFingerprintField(fingerprint.Version) != "" ||
+		normalizeFingerprintField(fingerprint.Info) != "" ||
+		normalizeFingerprintField(fingerprint.Hostname) != "" ||
+		normalizeFingerprintField(fingerprint.OperatingSystem) != "" ||
+		normalizeFingerprintField(fingerprint.DeviceType) != ""
+}
+
+func isGenericHTTPProduct(product string) bool {
+	product = strings.ToLower(product)
+	return strings.Contains(product, "tengine") ||
+		strings.Contains(product, "nginx") ||
+		strings.Contains(product, "openresty")
+}
+
+func normalizeFingerprintField(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	switch value {
+	case "", "cpe:":
+		return ""
+	default:
+		return value
+	}
+}
+
+func detectRepeatedHTTPNoiseReasons(results []BatchPortResult, options normalizedBatchScanOptions) map[int]string {
+	type signatureGroup struct {
+		reason string
+		ports  []int
+	}
+
+	grouped := make(map[string]signatureGroup)
+	for _, result := range results {
+		signature, reason := buildRepeatedHTTPNoiseSignature(result, options)
+		if signature == "" {
+			continue
+		}
+		group := grouped[signature]
+		group.reason = reason
+		group.ports = append(group.ports, result.Port)
+		grouped[signature] = group
+	}
+
+	reasonsByPort := make(map[int]string)
+	for _, group := range grouped {
+		if len(group.ports) < minRepeatedHTTPNoisePorts {
+			continue
+		}
+		for _, port := range group.ports {
+			reasonsByPort[port] = group.reason
+		}
+	}
+	return reasonsByPort
+}
+
+func buildRepeatedHTTPNoiseSignature(result BatchPortResult, options normalizedBatchScanOptions) (string, string) {
+	if result.Port < options.suspiciousHighPortStart {
+		return "", ""
+	}
+	if result.Status != Matched && result.Status != NotMatched {
+		return "", ""
+	}
+	if result.Response == nil || result.Response.Raw == "" {
+		return "", ""
+	}
+
+	fingerprint := result.Response.FingerPrint
+	if fingerprint == nil {
+		return "", ""
+	}
+	if hasStrongFingerprintMetadata(fingerprint) {
+		return "", ""
+	}
+	if fingerprint.ProductName != "" && !isGenericHTTPProduct(fingerprint.ProductName) {
+		return "", ""
+	}
+	switch fingerprint.Service {
+	case "http", "ssl/http", "http-proxy":
+	default:
+		return "", ""
+	}
+
+	raw := strings.ToLower(result.Response.Raw)
+	if !strings.HasPrefix(raw, "http/1.") && !strings.HasPrefix(raw, "http/2") {
+		return "", ""
+	}
+
+	statusCode := extractHTTPStatusCode(raw)
+	if statusCode < 400 || statusCode > 599 {
+		return "", ""
+	}
+
+	serverHeader := extractHTTPHeader(raw, "server:")
+	if serverHeader == "" {
+		return "", ""
+	}
+	if serverHeader == "tengine" && statusCode == 410 {
+		return "", ""
+	}
+	return serverHeader + "|" + statusCodeCategory(statusCode), "repeated generic http edge response on high port"
+}
+
+func extractHTTPStatusCode(raw string) int {
+	firstLine := raw
+	if newline := strings.IndexByte(firstLine, '\n'); newline >= 0 {
+		firstLine = firstLine[:newline]
+	}
+	fields := strings.Fields(firstLine)
+	if len(fields) < 2 {
+		return 0
+	}
+	code := 0
+	for _, ch := range fields[1] {
+		if ch < '0' || ch > '9' {
+			return 0
+		}
+		code = code*10 + int(ch-'0')
+	}
+	return code
+}
+
+func extractHTTPHeader(raw, header string) string {
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, header) {
+			continue
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(line, header))
+		if slash := strings.IndexByte(value, '/'); slash >= 0 {
+			value = value[:slash]
+		}
+		if semi := strings.IndexByte(value, ';'); semi >= 0 {
+			value = value[:semi]
+		}
+		if space := strings.IndexByte(value, ' '); space >= 0 {
+			value = value[:space]
+		}
+		return value
+	}
+	return ""
+}
+
+func statusCodeCategory(code int) string {
+	return string(rune('0' + code/100))
 }

@@ -108,6 +108,26 @@ func TestAnalyzeHostBatchResultFlagsSuspiciousHighPortOpenOnly(t *testing.T) {
 	}
 }
 
+func TestAnalyzeHostBatchResultFlagsNotMatchedHighPortWithoutFingerprint(t *testing.T) {
+	results := []BatchPortResult{
+		{Port: 9997, Status: NotMatched},
+		{Port: 443, Status: Matched, Response: &Response{FingerPrint: &FingerPrint{Service: "http", ProductName: "nginx"}}},
+	}
+	openPorts := []int{443, 9997}
+	analyzed := analyzeHostBatchResult("example", openPorts, results, normalizedBatchScanOptions{
+		suspiciousOpenThreshold: 2,
+		suspiciousHighPortStart: 1024,
+		suspiciousOpenRatio:     0.40,
+	})
+
+	if len(analyzed.SuspiciousPorts) != 1 || analyzed.SuspiciousPorts[0] != 9997 {
+		t.Fatalf("expected only high not-matched port to be suspicious, got %#v", analyzed.SuspiciousPorts)
+	}
+	if len(analyzed.StablePorts) != 1 || analyzed.StablePorts[0] != 443 {
+		t.Fatalf("expected 443 to remain stable, got %#v", analyzed.StablePorts)
+	}
+}
+
 func TestAnalyzeHostBatchResultFlagsGenericWrappedFingerprintOnHighPort(t *testing.T) {
 	results := []BatchPortResult{
 		{
@@ -140,6 +160,90 @@ func TestAnalyzeHostBatchResultFlagsGenericWrappedFingerprintOnHighPort(t *testi
 	}
 	if len(analyzed.StablePorts) != 1 || analyzed.StablePorts[0] != 80 {
 		t.Fatalf("expected port 80 to remain stable, got %#v", analyzed.StablePorts)
+	}
+}
+
+func TestAnalyzeHostBatchResultFlagsGenericTengineHTTPOnHighPort(t *testing.T) {
+	results := []BatchPortResult{
+		{
+			Port:   10080,
+			Status: Matched,
+			Response: &Response{
+				Raw: "HTTP/1.1 410 Gone\r\nServer: Tengine\r\nContent-Length: 0\r\n\r\n",
+				FingerPrint: &FingerPrint{
+					Service: "http",
+				},
+			},
+		},
+		{
+			Port:   443,
+			Status: Matched,
+			Response: &Response{
+				FingerPrint: &FingerPrint{Service: "http", ProductName: "nginx"},
+			},
+		},
+	}
+	openPorts := []int{443, 10080}
+	analyzed := analyzeHostBatchResult("example", openPorts, results, normalizedBatchScanOptions{
+		suspiciousOpenThreshold: 2,
+		suspiciousHighPortStart: 1024,
+		suspiciousOpenRatio:     0.40,
+	})
+
+	if len(analyzed.SuspiciousPorts) != 0 {
+		t.Fatalf("expected generic tengine port to stay stable, got suspicious %#v", analyzed.SuspiciousPorts)
+	}
+	if len(analyzed.StablePorts) != 2 {
+		t.Fatalf("expected both ports to remain stable, got %#v", analyzed.StablePorts)
+	}
+}
+
+func TestAnalyzeHostBatchResultFlagsRepeatedGenericHTTPNoise(t *testing.T) {
+	results := []BatchPortResult{
+		{
+			Port:   12000,
+			Status: Matched,
+			Response: &Response{
+				Raw:         "HTTP/1.1 404 Not Found\r\nServer: nginx/1.24.0\r\nContent-Length: 0\r\n\r\n",
+				FingerPrint: &FingerPrint{Service: "http"},
+			},
+		},
+		{
+			Port:   12001,
+			Status: Matched,
+			Response: &Response{
+				Raw:         "HTTP/1.1 404 Not Found\r\nServer: nginx/1.24.0\r\nContent-Length: 0\r\n\r\n",
+				FingerPrint: &FingerPrint{Service: "http"},
+			},
+		},
+		{
+			Port:   12002,
+			Status: Matched,
+			Response: &Response{
+				Raw:         "HTTP/1.1 404 Not Found\r\nServer: nginx/1.24.0\r\nContent-Length: 0\r\n\r\n",
+				FingerPrint: &FingerPrint{Service: "http"},
+			},
+		},
+		{
+			Port:   443,
+			Status: Matched,
+			Response: &Response{
+				FingerPrint: &FingerPrint{Service: "http", ProductName: "nginx"},
+			},
+		},
+	}
+	openPorts := []int{443, 12000, 12001, 12002}
+	analyzed := analyzeHostBatchResult("example", openPorts, results, normalizedBatchScanOptions{
+		suspiciousOpenThreshold: 4,
+		suspiciousHighPortStart: 1024,
+		suspiciousOpenRatio:     0.40,
+	})
+
+	if len(analyzed.SuspiciousPorts) != 3 {
+		t.Fatalf("expected repeated generic http ports to be suspicious, got %#v", analyzed.SuspiciousPorts)
+	}
+	if len(analyzed.StablePorts) != 1 || analyzed.StablePorts[0] != 443 {
+		t.Fatalf("expected 443 to remain stable, got %#v", analyzed.StablePorts)
 	}
 }
 
