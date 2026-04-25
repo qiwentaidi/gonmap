@@ -15,3 +15,24 @@ func TestSendRejectsUDPProxy(t *testing.T) {
 		t.Fatalf("expected UDP-related error, got %v", err)
 	}
 }
+
+func TestSplitNetlocHost(t *testing.T) {
+	tests := []struct {
+		name   string
+		netloc string
+		want   string
+	}{
+		{name: "ipv4", netloc: "127.0.0.1:443", want: "127.0.0.1"},
+		{name: "ipv6", netloc: "[2001:db8::1]:443", want: "2001:db8::1"},
+		{name: "hostname", netloc: "example.com:443", want: "example.com"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitNetlocHost(tt.netloc)
+			if got != tt.want {
+				t.Fatalf("expected host %q, got %q", tt.want, got)
+			}
+		})
+	}
+}

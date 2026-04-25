@@ -126,6 +126,7 @@ status, resp := sdk.Scan("114.132.250.138", 80, &lib.ScanOptions{
 - `ProxyURL`
 - `ReadSize`
 - `DeepIdentify`
+- `DisableFingerprint`
 - `Protocol`
 
 ## 扫描协议
@@ -181,6 +182,7 @@ lib.Unknown
   端口开放，收到了响应，但现有指纹没有匹配上。
 - `Open`
   没有被明确判定为关闭，但也没有足够信息完成识别。
+  当启用 `DisableFingerprint` 时，TCP 端口连通后也会直接返回这个状态。
 - `Closed`
   明确关闭。
 - `Unknown`
@@ -209,6 +211,129 @@ lib.Unknown
 - `DeviceType`
 
 ## 常见使用模式
+
+### 0. 大规模目标先做端口发现，再做指纹识别
+
+如果你要扫几百个目标，尤其是全端口，不建议直接对每个 `host:port` 调 `sdk.Scan()`。
+
+原因很简单：
+
+- `sdk.Scan()` 的定位是服务识别，不是高速端口发现
+- 它会主动发送应用层探针，带宽和耗时都会明显高于纯 connect 扫描
+- RustScan 快的核心也是先做高速端口发现，再把开放端口交给后续识别工具
+
+推荐两阶段：
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/qiwentaidi/gonmap/lib"
+)
+
+func main() {
+	sdk := lib.New(nil)
+	ports := lib.ExpandPortRange(1, 65535)
+
+	openPorts := sdk.DiscoverOpenPorts([]string{"127.0.0.1"}, ports, &lib.PortDiscoveryOptions{
+		Timeout:     time.Second,
+		Concurrency: 4096,
+	})
+
+	for _, openPort := range openPorts {
+		status, resp := sdk.Scan(openPort.Host, openPort.Port, &lib.ScanOptions{
+			Timeout:  3 * time.Second,
+			Protocol: lib.ScanProtocolTCP,
+		})
+		fmt.Println(openPort.Host, openPort.Port, status, resp != nil)
+	}
+}
+```
+
+这条路径更接近 RustScan 的思路：
+
+- 第一阶段只做 TCP connect，速度快、带宽低
+- 第二阶段只对开放端口做 `gonmap` 指纹识别
+
+如果目标很多，优先调这两个参数：
+
+- `PortDiscoveryOptions.Concurrency`
+- `PortDiscoveryOptions.Timeout`
+
+如果你希望直接以“目标组 + 端口组”的方式跑完整流程，可以使用新的批量入口：
+
+```go
+result := sdk.ScanHostPorts("127.0.0.1", lib.ExpandPortRange(1, 1024), &lib.BatchScanOptions{
+	DiscoveryOptions: lib.PortDiscoveryOptions{
+		Timeout:     500 * time.Millisecond,
+		Concurrency: 1024,
+	},
+	FingerprintOptions: lib.ScanOptions{
+		Timeout:  2 * time.Second,
+		Protocol: lib.ScanProtocolTCP,
+	},
+	FingerprintWorkers: 64,
+})
+
+fmt.Println("open:", result.OpenPorts)
+fmt.Println("stable:", result.StablePorts)
+fmt.Println("suspicious:", result.SuspiciousPorts)
+fmt.Println("wrapped:", result.LikelyWrappedPorts)
+fmt.Println("likely_noise:", result.LikelyNoise, result.NoiseReason)
+```
+
+多目标版本：
+
+```go
+results := sdk.ScanHostsPorts([]string{
+	"dev-www.caocaokeji.cn",
+	"sandbox-center.caocaokeji.cn",
+}, lib.ExpandPortRange(1, 65535), &lib.BatchScanOptions{})
+```
+
+如果你的上层已经拿到一批单端口结果，也可以只做后处理分析：
+
+```go
+analysis := lib.AnalyzeHostResults("example.com", []int{80, 20000}, []lib.BatchPortResult{
+	{
+		Port:   80,
+		Status: lib.Matched,
+		Response: &lib.Response{
+			FingerPrint: &lib.FingerPrint{Service: "http", ProductName: "nginx"},
+		},
+	},
+	{
+		Port:   20000,
+		Status: lib.Open,
+	},
+}, &lib.BatchScanOptions{})
+
+fmt.Println(analysis.StablePorts)
+fmt.Println(analysis.SuspiciousPorts)
+fmt.Println(analysis.LikelyWrappedPorts)
+```
+
+这个入口会：
+
+- 先批量做开放测试
+- 再只对开放端口做指纹识别
+- 最后按主机汇总结果
+- 对“高位端口大量 generic open”做疑似噪音标记
+- 对“高位端口统一落成 generic wrapped fingerprint”做疑似边界接管标记
+
+如果你只关心端口是否开放，不关心协议识别，可以直接关闭识别层：
+
+```go
+status, resp := sdk.Scan("127.0.0.1", 22, &lib.ScanOptions{
+	Timeout:            500 * time.Millisecond,
+	Protocol:           lib.ScanProtocolTCP,
+	DisableFingerprint: true,
+})
+fmt.Println(status, resp == nil) // Open true
+```
 
 ### 1. 默认参数统一配置
 

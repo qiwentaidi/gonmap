@@ -18,6 +18,7 @@ import (
 const (
 	defaultHost       = "114.132.250.138"
 	defaultWorkers    = 1000
+	defaultDiscover   = 4096
 	tcpScanTimeout    = 8 * time.Second
 	udpScanTimeout    = 5 * time.Second
 	defaultPortGroups = "21,22,23,25,53,U:53,U:69,80,81,U:88,110,111,U:111,123,U:123,135,U:137,139,U:161,U:177,389,U:427,443,445,465,500,515,U:520,U:523,548,623,U:626,636,873,902,1080,1099,1433,U:1434,1521,U:1604,U:1645,U:1701,1883,U:1900,2049,2181,2375,2379,U:2425,3128,3306,3389,4730,U:5060,5222,U:5351,U:5353,5432,5555,5601,5672,U:5683,5900,5938,5984,6000,6379,7001,7077,8080,8081,8443,8545,8686,9000,9001,9042,9092,9100,9200,9418,9999,11211,U:11211,27017,U:33848,37777,50000,50070,61616"
@@ -44,6 +45,7 @@ type result struct {
 func main() {
 	host := flag.String("host", defaultHost, "target host")
 	workers := flag.Int("workers", defaultWorkers, "ants pool size")
+	discoveryWorkers := flag.Int("discover-workers", defaultDiscover, "tcp connect discovery concurrency")
 	fullTCP := flag.Bool("full-tcp", false, "scan all TCP ports (1-65535)")
 	includeUDP := flag.Bool("include-udp", false, "include UDP ports from default port groups")
 	flag.Parse()
@@ -52,6 +54,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	addresses = filterTCPByDiscovery(addresses, *host, *discoveryWorkers)
 
 	start := time.Now()
 	runtime.GC()
@@ -158,6 +161,7 @@ func main() {
 	})
 
 	fmt.Printf("Target: %s\n", *host)
+	fmt.Printf("DiscoveryWorkers: %d\n", *discoveryWorkers)
 	fmt.Printf("Workers: %d\n", *workers)
 	fmt.Printf("Ports: %d\n", len(addresses))
 	fmt.Printf("Elapsed: %s\n", elapsed)
@@ -179,6 +183,38 @@ func main() {
 		}
 		fmt.Println()
 	}
+}
+
+func filterTCPByDiscovery(addresses []address, host string, discoveryWorkers int) []address {
+	tcpPorts := make([]int, 0, len(addresses))
+	udpAddresses := make([]address, 0, len(addresses))
+	addressByPort := make(map[int]address, len(addresses))
+	for _, item := range addresses {
+		if item.Protocol == "udp" {
+			udpAddresses = append(udpAddresses, item)
+			continue
+		}
+		tcpPorts = append(tcpPorts, item.Port)
+		addressByPort[item.Port] = item
+	}
+
+	if len(tcpPorts) == 0 {
+		return udpAddresses
+	}
+
+	openPorts := gonmap.DiscoverOpenPorts([]string{host}, tcpPorts, &gonmap.PortDiscoveryOptions{
+		Timeout:     time.Second,
+		Concurrency: discoveryWorkers,
+	})
+
+	filtered := make([]address, 0, len(openPorts)+len(udpAddresses))
+	for _, openPort := range openPorts {
+		if item, ok := addressByPort[openPort.Port]; ok {
+			filtered = append(filtered, item)
+		}
+	}
+	filtered = append(filtered, udpAddresses...)
+	return filtered
 }
 
 func buildAddresses(host, spec string, fullTCP, includeUDP bool) ([]address, error) {

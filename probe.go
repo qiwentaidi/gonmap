@@ -3,6 +3,7 @@ package gonmap
 import (
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -36,9 +37,10 @@ type probe struct {
 }
 
 func (p *probe) scan(host string, port int, tls bool, timeout time.Duration, size int, proxyURL string) (string, bool, error) {
-	uri := fmt.Sprintf("%s:%d", host, port)
+	portText := strconv.Itoa(port)
+	uri := net.JoinHostPort(host, portText)
 
-	sendRaw := strings.ReplaceAll(p.sendRaw, "{Host}", fmt.Sprintf("%s:%d", host, port))
+	sendRaw := strings.ReplaceAll(p.sendRaw, "{Host}", uri)
 
 	text, err := simplenet.Send(p.protocol, tls, uri, sendRaw, timeout, size, proxyURL)
 	if err == nil {

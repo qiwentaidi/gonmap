@@ -15,6 +15,14 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+func splitNetlocHost(netloc string) string {
+	host, _, err := net.SplitHostPort(netloc)
+	if err == nil {
+		return host
+	}
+	return netloc
+}
+
 type deadlineConn interface {
 	io.ReadWriteCloser
 	SetReadDeadline(time.Time) error
@@ -172,7 +180,7 @@ func tlsSendWithProxy(protocol string, netloc string, data string, duration time
 	// 封装为 TLS 连接
 	tlsConn := tls.Client(rawConn, &tls.Config{
 		InsecureSkipVerify: true, // 跳过证书验证（生产环境需要谨慎）
-		ServerName:         strings.Split(netloc, ":")[0],
+		ServerName:         splitNetlocHost(netloc),
 	})
 
 	// 执行 TLS 握手

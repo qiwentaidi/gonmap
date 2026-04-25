@@ -1,7 +1,10 @@
 package gonmap
 
 import (
+	"net"
+	"strconv"
 	"strings"
+	"time"
 
 	arrayutil "github.com/qiwentaidi/utils/array"
 )
@@ -25,6 +28,16 @@ func newScanSession(engine *Nmap, host string, port int, options ScanOptions) *S
 }
 
 func (s *ScanSession) scan() (status Status, response *Response) {
+	if s.options.DisableFingerprint && s.canUseLightweightOpenCheck() {
+		return s.scanOpenOnly()
+	}
+	if s.shouldRunLightweightOpenCheck() {
+		status, response = s.scanOpenOnly()
+		if status == Closed {
+			return Closed, nil
+		}
+	}
+
 	probeNames := s.resolveProbeNames()
 	if len(probeNames) == 0 {
 		return Unknown, &Response{}
@@ -37,6 +50,28 @@ func (s *ScanSession) scan() (status Status, response *Response) {
 	}
 	status, response = s.getRealResponse(probeNames[1:]...)
 	return status, response
+}
+
+func (s *ScanSession) scanOpenOnly() (Status, *Response) {
+	timeout := s.options.Timeout
+	if timeout <= 0 {
+		timeout = defaultScanTimeout
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(s.host, strconv.Itoa(s.port)), timeout)
+	if err != nil {
+		return Closed, nil
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	_ = conn.Close()
+	return Open, nil
+}
+
+func (s *ScanSession) shouldRunLightweightOpenCheck() bool {
+	return !s.options.DisableFingerprint && s.canUseLightweightOpenCheck()
+}
+
+func (s *ScanSession) canUseLightweightOpenCheck() bool {
+	return s.options.Protocol != ScanProtocolUDP && s.options.ProxyURL == ""
 }
 
 func (s *ScanSession) resolveProbeNames() []string {

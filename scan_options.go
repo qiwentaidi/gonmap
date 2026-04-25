@@ -20,6 +20,7 @@ type ScanOptions struct {
 	ProxyURL     string
 	ReadSize     int
 	DeepIdentify bool
+	DisableFingerprint bool
 	Protocol     ScanProtocol
 }
 
@@ -46,6 +47,9 @@ func (n *Nmap) normalizeScanOptions(options *ScanOptions) ScanOptions {
 	}
 	if options.DeepIdentify {
 		normalized.DeepIdentify = true
+	}
+	if options.DisableFingerprint {
+		normalized.DisableFingerprint = true
 	}
 	if options.Protocol != "" {
 		normalized.Protocol = options.Protocol

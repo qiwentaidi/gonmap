@@ -8,8 +8,11 @@ import (
 
 type Status = gonmap.Status
 type Response = gonmap.Response
+type FingerPrint = gonmap.FingerPrint
 type ScanOptions = gonmap.ScanOptions
 type ScanProtocol = gonmap.ScanProtocol
+type PortDiscoveryOptions = gonmap.PortDiscoveryOptions
+type OpenPort = gonmap.OpenPort
 
 const (
 	ScanProtocolAuto = gonmap.ScanProtocolAuto
@@ -30,6 +33,8 @@ type Options struct {
 	Filter int
 	// DeepIdentify 表示是否启用更深度的探针识别流程。
 	DeepIdentify bool
+	// DisableFingerprint 表示只判断端口是否开放，不做协议识别。
+	DisableFingerprint bool
 	// Timeout 是单个端口扫描的默认超时时间。
 	Timeout time.Duration
 	// ProxyURL 是默认代理地址，目前主要用于 TCP 扫描。
@@ -62,6 +67,7 @@ func New(options *Options) *SDK {
 			ProxyURL:     options.ProxyURL,
 			ReadSize:     options.ReadSize,
 			DeepIdentify: options.DeepIdentify,
+			DisableFingerprint: options.DisableFingerprint,
 			Protocol:     options.Protocol,
 		}
 	}
@@ -84,6 +90,9 @@ func (s *SDK) Scan(host string, port int, options *ScanOptions) (Status, *Respon
 		if options.DeepIdentify {
 			merged.DeepIdentify = true
 		}
+		if options.DisableFingerprint {
+			merged.DisableFingerprint = true
+		}
 		if options.Protocol != "" {
 			merged.Protocol = options.Protocol
 		}
@@ -93,4 +102,12 @@ func (s *SDK) Scan(host string, port int, options *ScanOptions) (Status, *Respon
 
 func (s *SDK) Engine() *gonmap.Nmap {
 	return s.engine
+}
+
+func (s *SDK) DiscoverOpenPorts(hosts []string, ports []int, options *PortDiscoveryOptions) []OpenPort {
+	return gonmap.DiscoverOpenPorts(hosts, ports, options)
+}
+
+func ExpandPortRange(startPort, endPort int) []int {
+	return gonmap.ExpandPortRange(startPort, endPort)
 }

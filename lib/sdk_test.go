@@ -7,9 +7,10 @@ import (
 
 func TestSDKMergesDefaultScanOptions(t *testing.T) {
 	sdk := New(&Options{
-		Timeout:  5 * time.Second,
-		ReadSize: 2048,
-		Protocol: ScanProtocolTCP,
+		Timeout:            5 * time.Second,
+		ReadSize:           2048,
+		DisableFingerprint: true,
+		Protocol:           ScanProtocolTCP,
 	})
 
 	if sdk.defaultScanOptions.Timeout != 5*time.Second {
@@ -20,6 +21,9 @@ func TestSDKMergesDefaultScanOptions(t *testing.T) {
 	}
 	if sdk.defaultScanOptions.Protocol != ScanProtocolTCP {
 		t.Fatalf("expected default protocol to be tcp, got %q", sdk.defaultScanOptions.Protocol)
+	}
+	if !sdk.defaultScanOptions.DisableFingerprint {
+		t.Fatal("expected disable fingerprint to be enabled")
 	}
 }
 
