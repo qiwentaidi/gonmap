@@ -195,9 +195,6 @@ func (s *ScanSession) getResponse(tls bool, p *probe) (Status, *Response) {
 		if strings.Contains(err.Error(), "STEP1") {
 			return Closed, nil
 		}
-		if strings.Contains(err.Error(), "STEP2") {
-			return Closed, nil
-		}
 		if p.protocol == "UDP" && strings.Contains(err.Error(), "refused") {
 			return Closed, nil
 		}
@@ -210,10 +207,23 @@ func (s *ScanSession) getResponse(tls bool, p *probe) (Status, *Response) {
 		FingerPrint: &FingerPrint{},
 	}
 	fingerPrint := s.engine.getFinger(text, tls, p.name)
+	enrichFingerprintByPort(s.port, fingerPrint)
 	response.FingerPrint = fingerPrint
 
 	if fingerPrint.Service == "" {
 		return NotMatched, response
 	}
 	return Matched, response
+}
+
+func enrichFingerprintByPort(port int, fingerPrint *FingerPrint) {
+	if fingerPrint == nil {
+		return
+	}
+
+	if port == 54321 && fingerPrint.Service == "postgresql" &&
+		(fingerPrint.ProductName == "" || fingerPrint.ProductName == "PostgreSQL DB" || fingerPrint.ProductName == "KingbaseES") {
+		fingerPrint.Service = "kingbase"
+		fingerPrint.ProductName = "KingbaseES"
+	}
 }

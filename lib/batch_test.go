@@ -5,6 +5,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/qiwentaidi/gonmap"
 )
 
 func TestScanHostPortsDiscoversAndIdentifiesHTTP(t *testing.T) {
@@ -61,6 +63,89 @@ func TestScanHostPortsDiscoversAndIdentifiesHTTP(t *testing.T) {
 	}
 	if service := result.Results[0].Response.FingerPrint.Service; service != "http" {
 		t.Fatalf("expected http service, got %q", service)
+	}
+}
+
+func TestScanHostPortsRespectsSDKFilter(t *testing.T) {
+	t.Cleanup(func() {
+		gonmap.SetFilter(9)
+	})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:5005")
+	if err != nil {
+		t.Skipf("failed to reserve jdwp test port 5005: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+				buf := make([]byte, 1024)
+				n, _ := c.Read(buf)
+				if string(buf[:n]) == "JDWP-Handshake" {
+					_, _ = c.Write([]byte("JDWP-Handshake"))
+				}
+			}(conn)
+		}
+	}()
+
+	options := &BatchScanOptions{
+		DiscoveryOptions: PortDiscoveryOptions{
+			Timeout:     200 * time.Millisecond,
+			Concurrency: 16,
+		},
+		FingerprintOptions: ScanOptions{
+			Timeout:  500 * time.Millisecond,
+			Protocol: ScanProtocolTCP,
+		},
+		FingerprintWorkers: 4,
+	}
+
+	lowFilterSDK := New(&Options{
+		Filter:   1,
+		Timeout:  500 * time.Millisecond,
+		Protocol: ScanProtocolTCP,
+	})
+	highFilterSDK := New(&Options{
+		Filter:   9,
+		Timeout:  500 * time.Millisecond,
+		Protocol: ScanProtocolTCP,
+	})
+
+	lowFilterResult := lowFilterSDK.ScanHostPorts("127.0.0.1", []int{5005}, options)
+	highFilterResult := highFilterSDK.ScanHostPorts("127.0.0.1", []int{5005}, options)
+
+	if len(lowFilterResult.OpenPorts) != 1 || lowFilterResult.OpenPorts[0] != 5005 {
+		t.Fatalf("expected low-filter scan to discover port 5005, got %#v", lowFilterResult.OpenPorts)
+	}
+	if len(highFilterResult.OpenPorts) != 1 || highFilterResult.OpenPorts[0] != 5005 {
+		t.Fatalf("expected high-filter scan to discover port 5005, got %#v", highFilterResult.OpenPorts)
+	}
+	if len(lowFilterResult.Results) != 1 || len(highFilterResult.Results) != 1 {
+		t.Fatalf("expected both scans to have one fingerprint result, low=%#v high=%#v", lowFilterResult.Results, highFilterResult.Results)
+	}
+
+	if lowFilterResult.Results[0].Status == Matched &&
+		lowFilterResult.Results[0].Response != nil &&
+		lowFilterResult.Results[0].Response.FingerPrint != nil &&
+		lowFilterResult.Results[0].Response.FingerPrint.Service == "jdwp" {
+		t.Fatalf("expected low filter to exclude the rarity-8 jdwp probe, got %#v", lowFilterResult.Results[0])
+	}
+
+	if highFilterResult.Results[0].Status != Matched {
+		t.Fatalf("expected high filter to match jdwp, got %#v", highFilterResult.Results[0])
+	}
+	if highFilterResult.Results[0].Response == nil || highFilterResult.Results[0].Response.FingerPrint == nil {
+		t.Fatalf("expected high filter to return fingerprint response, got %#v", highFilterResult.Results[0].Response)
+	}
+	if service := highFilterResult.Results[0].Response.FingerPrint.Service; service != "jdwp" {
+		t.Fatalf("expected jdwp service with high filter, got %q", service)
 	}
 }
 
@@ -244,6 +329,47 @@ func TestAnalyzeHostBatchResultFlagsRepeatedGenericHTTPNoise(t *testing.T) {
 	}
 	if len(analyzed.StablePorts) != 1 || analyzed.StablePorts[0] != 443 {
 		t.Fatalf("expected 443 to remain stable, got %#v", analyzed.StablePorts)
+	}
+}
+
+func TestAnalyzeHostBatchResultFlagsMassGenericOpenDensity(t *testing.T) {
+	results := make([]BatchPortResult, 0, 130)
+	openPorts := make([]int, 0, 130)
+	for port := 1; port <= 129; port++ {
+		results = append(results, BatchPortResult{Port: port, Status: Open})
+		openPorts = append(openPorts, port)
+	}
+	results = append(results, BatchPortResult{
+		Port:   443,
+		Status: Matched,
+		Response: &Response{
+			FingerPrint: &FingerPrint{Service: "http", ProductName: "nginx"},
+		},
+	})
+	openPorts = append(openPorts, 443)
+
+	analyzed := analyzeHostBatchResult("example", openPorts, results, normalizedBatchScanOptions{
+		suspiciousOpenThreshold: 128,
+		suspiciousHighPortStart: 1024,
+		suspiciousOpenRatio:     0.60,
+	})
+
+	if len(analyzed.StablePorts) != 1 || analyzed.StablePorts[0] != 443 {
+		t.Fatalf("expected only 443 to remain stable, got %#v", analyzed.StablePorts)
+	}
+	if len(analyzed.SuspiciousPorts) != 129 {
+		t.Fatalf("expected generic open ports to be suspicious, got %d", len(analyzed.SuspiciousPorts))
+	}
+	for _, item := range analyzed.Results {
+		if item.Port == 443 {
+			if item.Suspicious {
+				t.Fatalf("expected 443 to remain stable, got %#v", item)
+			}
+			continue
+		}
+		if item.SuspiciousReason != "generic open without fingerprint on host with abnormal open-port density" {
+			t.Fatalf("unexpected suspicious reason for port %d: %#v", item.Port, item)
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package simplenet
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -229,4 +230,108 @@ func Send(protocol string, tls bool, netloc string, data string, duration time.D
 	} else {
 		return tcpSend(protocol, netloc, data, duration, size)
 	}
+}
+
+func dialRaw(network, netloc string, duration time.Duration, proxyURL string) (net.Conn, error) {
+	network = strings.ToLower(network)
+	if proxyURL == "" {
+		conn, err := net.DialTimeout(network, netloc, duration)
+		if err != nil {
+			return nil, errors.New(err.Error() + " STEP1:CONNECT")
+		}
+		return conn, nil
+	}
+
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse proxy URL: %w", err)
+	}
+	var auth *proxy.Auth
+	if u.User != nil {
+		username := u.User.Username()
+		password, _ := u.User.Password()
+		auth = &proxy.Auth{User: username, Password: password}
+	}
+	dialer, err := proxy.SOCKS5("tcp", u.Host, auth, &net.Dialer{Timeout: duration})
+	if err != nil {
+		return nil, err
+	}
+	conn, err := dialer.Dial(network, netloc)
+	if err != nil {
+		return nil, errors.New(err.Error() + " STEP1:CONNECT")
+	}
+	return conn, nil
+}
+
+func buildPostgresStartupPacket(user, database string) []byte {
+	params := bytes.NewBuffer(nil)
+	if user != "" {
+		params.WriteString("user")
+		params.WriteByte(0)
+		params.WriteString(user)
+		params.WriteByte(0)
+	}
+	if database != "" {
+		params.WriteString("database")
+		params.WriteByte(0)
+		params.WriteString(database)
+		params.WriteByte(0)
+	}
+	params.WriteString("client_encoding")
+	params.WriteByte(0)
+	params.WriteString("UTF8")
+	params.WriteByte(0)
+	params.WriteByte(0)
+
+	totalLen := int32(4 + 4 + params.Len())
+	packet := bytes.NewBuffer(make([]byte, 0, totalLen))
+	_ = binary.Write(packet, binary.BigEndian, totalLen)
+	_ = binary.Write(packet, binary.BigEndian, int32(196608))
+	packet.Write(params.Bytes())
+	return packet.Bytes()
+}
+
+func SendPostgresStartup(netloc string, duration time.Duration, size int, useSSL bool, proxyURL string) (string, error) {
+	conn, err := dialRaw("tcp", netloc, duration, proxyURL)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+
+	var rw deadlineConn = conn.(deadlineConn)
+	if useSSL {
+		sslReq := []byte{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}
+		if _, err := conn.Write(sslReq); err != nil {
+			return "", errors.New(err.Error() + " PGSTEP2:WRITE")
+		}
+
+		reply := make([]byte, 1)
+		_ = conn.SetReadDeadline(time.Now().Add(duration))
+		if _, err := io.ReadFull(conn, reply); err != nil {
+			return "", errors.New(err.Error() + " PGSTEP2:SSLNEGOTIATE")
+		}
+		if reply[0] != 'S' {
+			return "", errors.New("server rejected postgres ssl negotiation PGSTEP2:SSLNEGOTIATE")
+		}
+
+		tlsConn := tls.Client(conn, &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS10,
+			ServerName:         splitNetlocHost(netloc),
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			return "", errors.New(err.Error() + " PGSTEP2:TLSHANDSHAKE")
+		}
+		rw = tlsConn
+	}
+
+	startup := buildPostgresStartupPacket("system", "system")
+	if _, err := rw.Write(startup); err != nil {
+		return "", errors.New(err.Error() + " PGSTEP2:WRITE")
+	}
+
+	// Startup/auth responses often arrive as a single frame while the server keeps
+	// the connection open for the next authentication step, so we should return
+	// after the first short read instead of waiting for EOF.
+	return readResponse(rw, size, true)
 }

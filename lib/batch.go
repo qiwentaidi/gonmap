@@ -13,6 +13,8 @@ const (
 	defaultSuspiciousHighPortStart   = 10000
 	defaultSuspiciousOpenRatio       = 0.60
 	minRepeatedHTTPNoisePorts        = 3
+	massGenericOpenThreshold         = 128
+	massGenericOpenRatio             = 0.80
 )
 
 type BatchScanOptions struct {
@@ -185,10 +187,14 @@ func analyzeHostBatchResult(host string, openPorts []int, results []BatchPortRes
 	analyzed := make([]BatchPortResult, len(results))
 	copy(analyzed, results)
 	repeatedHTTPNoiseReasons := detectRepeatedHTTPNoiseReasons(analyzed, options)
+	massGenericOpenReasons := detectMassGenericOpenReasons(analyzed)
 
 	suspiciousCount := 0
 	for index := range analyzed {
 		reason := repeatedHTTPNoiseReasons[analyzed[index].Port]
+		if reason == "" {
+			reason = massGenericOpenReasons[analyzed[index].Port]
+		}
 		if reason == "" {
 			reason = detectSuspiciousReason(analyzed[index], options)
 		}
@@ -272,6 +278,14 @@ func detectWrappedReason(result BatchPortResult, options normalizedBatchScanOpti
 }
 
 func detectGenericOpenReason(result BatchPortResult) string {
+	return detectGenericOpenReasonWithFloor(result, false)
+}
+
+func detectGenericOpenReasonWithoutFloor(result BatchPortResult) string {
+	return detectGenericOpenReasonWithFloor(result, false)
+}
+
+func detectGenericOpenReasonWithFloor(result BatchPortResult, requireHighPort bool) string {
 	if result.Status != Open && result.Status != NotMatched {
 		return ""
 	}
@@ -401,6 +415,34 @@ func detectRepeatedHTTPNoiseReasons(results []BatchPortResult, options normalize
 		for _, port := range group.ports {
 			reasonsByPort[port] = group.reason
 		}
+	}
+	return reasonsByPort
+}
+
+func detectMassGenericOpenReasons(results []BatchPortResult) map[int]string {
+	genericPorts := make([]int, 0)
+	totalOpenLike := 0
+	for _, result := range results {
+		if result.Status != Open && result.Status != NotMatched && result.Status != Matched {
+			continue
+		}
+		totalOpenLike++
+		if detectGenericOpenReasonWithoutFloor(result) == "" {
+			continue
+		}
+		genericPorts = append(genericPorts, result.Port)
+	}
+
+	if totalOpenLike < massGenericOpenThreshold || len(genericPorts) < massGenericOpenThreshold {
+		return nil
+	}
+	if float64(len(genericPorts))/float64(totalOpenLike) < massGenericOpenRatio {
+		return nil
+	}
+
+	reasonsByPort := make(map[int]string, len(genericPorts))
+	for _, port := range genericPorts {
+		reasonsByPort[port] = "generic open without fingerprint on host with abnormal open-port density"
 	}
 	return reasonsByPort
 }

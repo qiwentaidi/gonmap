@@ -42,6 +42,15 @@ func (p *probe) scan(host string, port int, tls bool, timeout time.Duration, siz
 
 	sendRaw := strings.ReplaceAll(p.sendRaw, "{Host}", uri)
 
+	switch sendRaw {
+	case "__KB_STARTUP__":
+		text, err := simplenet.SendPostgresStartup(uri, timeout, size, false, proxyURL)
+		return text, false, err
+	case "__KB_STARTUP_SSL__":
+		text, err := simplenet.SendPostgresStartup(uri, timeout, size, true, proxyURL)
+		return text, true, err
+	}
+
 	text, err := simplenet.Send(p.protocol, tls, uri, sendRaw, timeout, size, proxyURL)
 	if err == nil {
 		return text, tls, nil

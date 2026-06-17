@@ -104,6 +104,10 @@ func customNMAPMatch() {
 	//新增自定义指纹信息
 	nmap.AddMatch("TCP_GetRequest", `echo m|^GET / HTTP/1.0\r\n\r\n$|s`)
 	nmap.AddMatch("TCP_GetRequest", `mongodb m|.*It looks like you are trying to access MongoDB.*|s p/MongoDB/`)
+	nmap.AddMatch("TCP_GetRequest", `http m|^HTTP/1\.[01] 200 OK\r\n(?:[^\r\n]+\r\n)*?X-Elastic-Product: Elasticsearch\r\n.*"number"[[:space:]]*:[[:space:]]*"([\w._-]+)"|is p/Elasticsearch/ v/$1/ cpe:/a:elasticsearch:elasticsearch:$1/`)
+	nmap.AddMatch("TCP_GetRequest", `http m|^HTTP/1\.[01] \d\d\d [^\r\n]+\r\n(?:[^\r\n]+\r\n)*?X-Elastic-Product: Elasticsearch\r\n|i p/Elasticsearch/ cpe:/a:elasticsearch:elasticsearch/`)
+	nmap.AddMatch("TCP_GetRequest", `http m|^HTTP/1\.[01] 200 OK\r\n(?:[^\r\n]+\r\n)*?\r\n\{.*"version"[[:space:]]*:[[:space:]]*\{.*"distribution"[[:space:]]*:[[:space:]]*"opensearch".*"number"[[:space:]]*:[[:space:]]*"([\w._-]+)".*"tagline"[[:space:]]*:[[:space:]]*"The OpenSearch Project: https://opensearch\.org/"|is p/OpenSearch/ v/$1/ cpe:/a:opensearch:opensearch:$1/`)
+	nmap.AddMatch("TCP_GetRequest", `http m|^HTTP/1\.[01] 401 Unauthorized\r\n(?:[^\r\n]+\r\n)*?WWW-Authenticate: Basic realm="security", charset="UTF-8"\r\nWWW-Authenticate: ApiKey\r\n(?:[^\r\n]+\r\n)*?\r\n\{"error":\{"root_cause":\[{"type":"security_exception","reason":"missing authentication credentials for REST request \[/\]"|i p/Elasticsearch/ cpe:/a:elasticsearch:elasticsearch/`)
 	nmap.AddMatch("TCP_GetRequest", `http m|^HTTP/1\.[01] \d\d\d (?:[^\r\n]+\r\n)*?Server: ([^\r\n]+)| p/$1/`)
 	nmap.AddMatch("TCP_GetRequest", `http m|^HTTP/1\.[01] \d\d\d|`)
 	nmap.AddMatch("TCP_NULL", `mysql m|.\x00\x00..j\x04Host '.*' is not allowed to connect to this MariaDB server| p/MariaDB/`)
@@ -155,6 +159,10 @@ func optimizeNMAPProbes() {
 	nmap.portProbeMap[6000] = append(nmap.portProbeMap[6000], "TCP_Socks5")
 	nmap.portProbeMap[7000] = append(nmap.portProbeMap[7000], "TCP_Socks5")
 	nmap.portProbeMap[5236] = append(nmap.portProbeMap[5236], "TCP_Dameng")
+	nmap.portProbeMap[54321] = append(nmap.portProbeMap[54321], "TCP_GenericLines")
+	nmap.portProbeMap[54321] = append(nmap.portProbeMap[54321], "TCP_SMBProgNeg")
+	nmap.portProbeMap[54321] = append(nmap.portProbeMap[54321], "TCP_KB_POSTGRES_STARTUP")
+	nmap.portProbeMap[54321] = append(nmap.portProbeMap[54321], "TCP_KB_POSTGRES_SSL_STARTUP")
 	//将TCP_GetRequest的fallback参数设置为NULL探针，避免漏资产
 	nmap.probeNameMap["TCP_GenericLines"].fallback = "TCP_NULL"
 	nmap.probeNameMap["TCP_GetRequest"].fallback = "TCP_NULL"

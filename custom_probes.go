@@ -44,4 +44,22 @@ match dameng m|(\d+\.\d+\.\d+\.\d+)| p/Dameng Database/ v/$1/
 match dameng m|\x44\x4d| p/Dameng Database/ i/DMDB protocol/
 
 # 条件 3：响应长度在合理区间（隐式约束）
+##############################NEXT PROBE##############################
+Probe TCP KB_POSTGRES_STARTUP q|__KB_STARTUP__|
+rarity 8
+ports 54321
+
+match postgresql m|^\x52\x00\x00\x00\x08\x00\x00\x00\x03| p/PostgreSQL DB/ i/Cleartext password auth/
+match postgresql m|^\x52\x00\x00\x00\x0c\x00\x00\x00\x05....| p/PostgreSQL DB/ i/MD5 password auth/
+match postgresql m|^\x52....\x00\x00\x00\x0a|s p/PostgreSQL DB/ i/SASL auth/
+match postgresql m|^\x52\x00\x00\x00\x08\x00\x00\x00\x00| p/PostgreSQL DB/ i/Authentication OK/
+##############################NEXT PROBE##############################
+Probe TCP KB_POSTGRES_SSL_STARTUP q|__KB_STARTUP_SSL__|
+rarity 8
+ports 54321
+
+match postgresql m|^\x52\x00\x00\x00\x08\x00\x00\x00\x03| p/PostgreSQL DB/ i/Cleartext password auth/
+match postgresql m|^\x52\x00\x00\x00\x0c\x00\x00\x00\x05....| p/PostgreSQL DB/ i/MD5 password auth/
+match postgresql m|^\x52....\x00\x00\x00\x0a|s p/PostgreSQL DB/ i/SASL auth/
+match postgresql m|^\x52\x00\x00\x00\x08\x00\x00\x00\x00| p/PostgreSQL DB/ i/Authentication OK/
 `
