@@ -78,6 +78,8 @@ func repairNMAPString() {
 	nmapServiceProbes = strings.ReplaceAll(nmapServiceProbes, "${backquote}", "`")
 	nmapServiceProbes = strings.ReplaceAll(nmapServiceProbes, `q|GET / HTTP/1.0\r\n\r\n|`,
 		`q|GET / HTTP/1.0\r\nHost: {Host}\r\nUser-Agent: Mozilla/5.0 (Windows; U; MSIE 9.0; Windows NT 9.0; en-US)\r\nAccept-Language: zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2\r\nAccept: */*\r\n\r\n|`)
+	nmapServiceProbes = strings.ReplaceAll(nmapServiceProbes, `q|GET /version HTTP/1.1\r\n\r\n|`,
+		`q|GET /version HTTP/1.1\r\nHost: {Host}\r\nUser-Agent: gonmap\r\nAccept: */*\r\n\r\n|`)
 	nmapServiceProbes = strings.ReplaceAll(nmapServiceProbes, `\1`, `$1`)
 	nmapServiceProbes = strings.ReplaceAll(nmapServiceProbes, `(?=\\)`, `(?:\\)`)
 	nmapServiceProbes = strings.ReplaceAll(nmapServiceProbes, `(?=[\w._-]{5,15}\r?\n$)`, `(?:[\w._-]{5,15}\r?\n$)`)
@@ -101,6 +103,11 @@ func repairNMAPString() {
 }
 
 func customNMAPMatch() {
+	prependTCPGetRequestMatches(
+		`http m|^HTTP/1\.[01] 200 OK\r\n(?:[^\r\n]+\r\n)*?Docker-Distribution-Api-Version: registry/([\d.]+)\r\n|i p/Docker Registry/ i/API $1/ cpe:/a:docker:docker/`,
+		`http m|^HTTP/1\.[01] 404 Not Found\r\n(?:[^\r\n]+\r\n)*?Docker-Distribution-Api-Version: registry/([\d.]+)\r\n|i p/Docker Registry/ i/API $1/ cpe:/a:docker:docker/`,
+		`http m|^HTTP/1\.[01] \d\d\d [^\r\n]+\r\n(?:[^\r\n]+\r\n)*?X-Kubernetes-Pf-Flowschema-Uid: [^\r\n]+\r\n(?:[^\r\n]+\r\n)*?X-Kubernetes-Pf-Prioritylevel-Uid: [^\r\n]+\r\n|i p/Kubernetes/ cpe:/a:kubernetes:kubernetes/`,
+	)
 	//新增自定义指纹信息
 	nmap.AddMatch("TCP_GetRequest", `echo m|^GET / HTTP/1.0\r\n\r\n$|s`)
 	nmap.AddMatch("TCP_GetRequest", `mongodb m|.*It looks like you are trying to access MongoDB.*|s p/MongoDB/`)
@@ -137,6 +144,22 @@ func customNMAPMatch() {
 	nmap.AddMatch("TCP_TerminalServerCookie", `ms-wbt-server m|^\x03\0\0\x13\x0e\xd0\0\0\x124\0\x02.*\0\x02\0\0\0| p/Microsoft Terminal Services/ o/Windows/ cpe:/o:microsoft:windows/a`)
 	nmap.AddMatch("TCP_redis-server", `redis m|^.*redis_version:([.\d]+)\n|s p/Redis key-value store/ v/$1/ cpe:/a:redislabs:redis:$1/`)
 	nmap.AddMatch("TCP_redis-server", `redis m|^-NOAUTH Authentication required.|s p/Redis key-value store/`)
+	nmap.AddMatch("TCP_docker", `docker m|^HTTP/1\.[01] 200 OK\r\n(?:[^\r\n]+\r\n)*?Api-Version: ([\d.]+)\r\n(?:[^\r\n]+\r\n)*?Ostype: ([^\r\n]+)\r\n(?:[^\r\n]+\r\n)*?Server: Docker/([\d\w.-]+) \([^\r\n]+\)\r\n(?:[^\r\n]+\r\n)*?\r\n\{.*"Version":"([^"]+)".*"KernelVersion":"([^"]+)".*"Os":"([^"]+)"|is p/Docker remote API/ v/$4/ i/API $1; KernelVersion $5/ o/$6/ cpe:/a:docker:docker:$4/`)
+	nmap.AddMatch("TCP_docker", `docker m|^HTTP/1\.[01] 200 OK\r\n(?:[^\r\n]+\r\n)*?Api-Version: ([\d.]+)\r\n(?:[^\r\n]+\r\n)*?Server: Docker/([\d\w.-]+) \([^\r\n]+\)\r\n|is p/Docker remote API/ v/$2/ i/API $1/ cpe:/a:docker:docker:$2/`)
+}
+
+func prependTCPGetRequestMatches(exprs ...string) {
+	probe := nmap.probeNameMap["TCP_GetRequest"]
+	if probe == nil || len(exprs) == 0 {
+		return
+	}
+
+	prepended := make([]*match, 0, len(exprs)+len(probe.matchGroup))
+	for _, expr := range exprs {
+		prepended = append(prepended, parseMatch(expr, false))
+	}
+	prepended = append(prepended, probe.matchGroup...)
+	probe.matchGroup = prepended
 }
 
 func optimizeNMAPProbes() {
@@ -158,6 +181,7 @@ func optimizeNMAPProbes() {
 	nmap.portProbeMap[2022] = append(nmap.portProbeMap[2022], "TCP_Socks5")
 	nmap.portProbeMap[6000] = append(nmap.portProbeMap[6000], "TCP_Socks5")
 	nmap.portProbeMap[7000] = append(nmap.portProbeMap[7000], "TCP_Socks5")
+	nmap.portProbeMap[2379] = append(nmap.portProbeMap[2379], "TCP_ETCD_VERSION")
 	nmap.portProbeMap[5236] = append(nmap.portProbeMap[5236], "TCP_Dameng")
 	nmap.portProbeMap[54321] = append(nmap.portProbeMap[54321], "TCP_GenericLines")
 	nmap.portProbeMap[54321] = append(nmap.portProbeMap[54321], "TCP_SMBProgNeg")
@@ -182,7 +206,11 @@ func New() *Nmap {
 }
 
 func GuessProtocol(port int) string {
-	return nmapServices[port]
+	protocol := nmapServices[port]
+	if !isReliablePortGuess(protocol) {
+		return ""
+	}
+	return protocol
 }
 
 var regexpFirstNum = regexp.MustCompile(`^\d`)
@@ -235,4 +263,19 @@ func FixProtocol(oldProtocol string) string {
 	}
 	oldProtocol = strings.ReplaceAll(oldProtocol, "_", "-")
 	return oldProtocol
+}
+
+func isReliablePortGuess(protocol string) bool {
+	if protocol == "" {
+		return false
+	}
+
+	// Nmap's port-name fallback includes many vendor/private labels that create
+	// noisy false positives when no banner was identified.
+	switch protocol {
+	case "XmlIpcRegSvc":
+		return false
+	}
+
+	return true
 }

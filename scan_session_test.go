@@ -1,7 +1,16 @@
 package gonmap
 
 import (
+	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"strings"
 	"testing"
@@ -328,6 +337,356 @@ func TestScanMatchesOpenSearchWithoutChangingHTTPService(t *testing.T) {
 	}
 }
 
+func TestScanMatchesDockerRegistryOverHTTPSBeforeGenericServerHeader(t *testing.T) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("failed to generate cert: %v", err)
+	}
+
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	})
+	if err != nil {
+		t.Fatalf("failed to listen tls: %v", err)
+	}
+	defer listener.Close()
+
+	response := strings.Join([]string{
+		"HTTP/1.1 200 OK",
+		"Server: nginx/1.18.0",
+		"Date: Thu, 18 Jun 2026 03:15:30 GMT",
+		"Content-Length: 0",
+		"Connection: close",
+		"Cache-Control: no-cache",
+		"Docker-Distribution-Api-Version: registry/2.0",
+		"",
+		"",
+	}, "\r\n")
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+				buf := make([]byte, 1024)
+				_, _ = c.Read(buf)
+				_, _ = c.Write([]byte(response))
+			}(conn)
+		}
+	}()
+
+	engine := New()
+	status, resp := engine.ScanWithOptions("127.0.0.1", listener.Addr().(*net.TCPAddr).Port, &ScanOptions{
+		Timeout:  500 * time.Millisecond,
+		Protocol: ScanProtocolTCP,
+		ReadSize: 4096,
+	})
+
+	if status != Matched {
+		t.Fatalf("expected matched status, got %v", status)
+	}
+	if resp == nil || resp.FingerPrint == nil {
+		t.Fatalf("expected fingerprint response, got %#v", resp)
+	}
+	if service := resp.FingerPrint.Service; service != "https" {
+		t.Fatalf("expected service https, got %q", service)
+	}
+	if product := resp.FingerPrint.ProductName; product != "Docker Registry" {
+		t.Fatalf("expected product Docker Registry, got %q", product)
+	}
+	if info := resp.FingerPrint.Info; info != "API 2.0" {
+		t.Fatalf("expected info API 2.0, got %q", info)
+	}
+}
+
+func TestScanRefinesPlainHTTPToHTTPSWhenServerExplicitlyRequiresTLS(t *testing.T) {
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		t.Fatalf("failed to generate cert: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	plainResponse := "HTTP/1.0 400 Bad Request\r\n\r\nClient sent an HTTP request to an HTTPS server.\n"
+	tlsResponse := strings.Join([]string{
+		"HTTP/1.1 403 Forbidden",
+		"Content-Type: text/plain; charset=utf-8",
+		"Content-Length: 78",
+		"",
+		"Forbidden (user=system:anonymous, verb=get, resource=nodes, subresource=proxy)",
+	}, "\r\n")
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+
+				buf := make([]byte, 2048)
+				n, err := c.Read(buf)
+				if err != nil {
+					return
+				}
+
+				payload := buf[:n]
+				if len(payload) > 0 && payload[0] == 0x16 {
+					tlsConn := tls.Server(&peekConn{Conn: c, reader: bytes.NewReader(payload)}, &tls.Config{
+						Certificates: []tls.Certificate{cert},
+					})
+					defer tlsConn.Close()
+
+					if err := tlsConn.Handshake(); err != nil {
+						return
+					}
+					_ = tlsConn.SetDeadline(time.Now().Add(2 * time.Second))
+					_, _ = tlsConn.Read(make([]byte, 2048))
+					_, _ = tlsConn.Write([]byte(tlsResponse))
+					return
+				}
+
+				_, _ = c.Write([]byte(plainResponse))
+			}(conn)
+		}
+	}()
+
+	engine := New()
+	status, resp := engine.ScanWithOptions("127.0.0.1", listener.Addr().(*net.TCPAddr).Port, &ScanOptions{
+		Timeout:  500 * time.Millisecond,
+		Protocol: ScanProtocolTCP,
+		ReadSize: 4096,
+	})
+
+	if status != Matched {
+		t.Fatalf("expected matched status, got %v", status)
+	}
+	if resp == nil || resp.FingerPrint == nil {
+		t.Fatalf("expected fingerprint response, got %#v", resp)
+	}
+	if !resp.TLS {
+		t.Fatalf("expected refined response to use TLS, got %#v", resp)
+	}
+	if service := resp.FingerPrint.Service; service != "https" {
+		t.Fatalf("expected service https, got %q", service)
+	}
+}
+
+func TestScanRefinesWeakDockerMatchWithVersionProbe(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	weakResponse := strings.Join([]string{
+		"HTTP/1.0 404 Not Found",
+		"Content-Type: application/json",
+		"Date: Thu, 18 Jun 2026 03:21:48 GMT",
+		"Content-Length: 29",
+		"",
+		`{"message":"page not found"}`,
+	}, "\r\n") + "\n"
+
+	strongResponse := strings.Join([]string{
+		"HTTP/1.1 200 OK",
+		"Content-Type: application/json",
+		"Job-Name: version",
+		"Date: Thu, 18 Jun 2026 03:21:49 GMT",
+		"Content-Length: 98",
+		"",
+		`{"ApiVersion":"1.41","KernelVersion":"5.15.0","Os":"linux","Version":"20.10.24"}`,
+	}, "\r\n")
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+				buf := make([]byte, 2048)
+				n, _ := c.Read(buf)
+				request := string(buf[:n])
+				if strings.Contains(request, "GET /version HTTP/1.1") {
+					_, _ = c.Write([]byte(strongResponse))
+					return
+				}
+				_, _ = c.Write([]byte(weakResponse))
+			}(conn)
+		}
+	}()
+
+	engine := New()
+	status, resp := engine.ScanWithOptions("127.0.0.1", listener.Addr().(*net.TCPAddr).Port, &ScanOptions{
+		Timeout:  500 * time.Millisecond,
+		Protocol: ScanProtocolTCP,
+		ReadSize: 4096,
+	})
+
+	if status != Matched {
+		t.Fatalf("expected matched status, got %v", status)
+	}
+	if resp == nil || resp.FingerPrint == nil {
+		t.Fatalf("expected fingerprint response, got %#v", resp)
+	}
+	if service := resp.FingerPrint.Service; service != "docker" {
+		t.Fatalf("expected service docker, got %q", service)
+	}
+	if product := resp.FingerPrint.ProductName; product != "Docker remote API" {
+		t.Fatalf("expected product Docker remote API, got %q", product)
+	}
+	if version := resp.FingerPrint.Version; version != "20.10.24" {
+		t.Fatalf("expected version 20.10.24, got %q", version)
+	}
+	if info := resp.FingerPrint.Info; info != "API 1.41; KernelVersion 5.15.0" {
+		t.Fatalf("expected Docker version probe info, got %q", info)
+	}
+}
+
+func TestScanRefinesWeakEtcdMatchWithVersionProbe(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	weakResponse := strings.Join([]string{
+		"HTTP/1.0 404 Not Found",
+		"Access-Control-Allow-Headers: accept, content-type, authorization",
+		"Access-Control-Allow-Methods: POST, GET, OPTIONS, PUT, DELETE",
+		"Access-Control-Allow-Origin: *",
+		"Content-Type: text/plain; charset=utf-8",
+		"",
+		"404 page not found",
+	}, "\r\n")
+
+	strongResponse := strings.Join([]string{
+		"HTTP/1.1 200 OK",
+		"Content-Type: application/json",
+		"Date: Thu, 18 Jun 2026 03:30:00 GMT",
+		"Content-Length: 45",
+		"",
+		`{"etcdserver":"3.5.10","etcdcluster":"3.5.0"}`,
+	}, "\r\n")
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+				buf := make([]byte, 2048)
+				n, _ := c.Read(buf)
+				request := string(buf[:n])
+				if strings.Contains(request, "GET /version HTTP/1.1") {
+					_, _ = c.Write([]byte(strongResponse))
+					return
+				}
+				_, _ = c.Write([]byte(weakResponse))
+			}(conn)
+		}
+	}()
+
+	engine := New()
+	status, resp := engine.ScanWithOptions("127.0.0.1", listener.Addr().(*net.TCPAddr).Port, &ScanOptions{
+		Timeout:  500 * time.Millisecond,
+		Protocol: ScanProtocolTCP,
+		ReadSize: 4096,
+	})
+
+	if status != Matched {
+		t.Fatalf("expected matched status, got %v", status)
+	}
+	if resp == nil || resp.FingerPrint == nil {
+		t.Fatalf("expected fingerprint response, got %#v", resp)
+	}
+	if service := resp.FingerPrint.Service; service != "etcd-client" {
+		t.Fatalf("expected service etcd-client, got %q", service)
+	}
+	if product := resp.FingerPrint.ProductName; product != "etcd" {
+		t.Fatalf("expected product etcd, got %q", product)
+	}
+	if version := resp.FingerPrint.Version; version != "3.5.10" {
+		t.Fatalf("expected version 3.5.10, got %q", version)
+	}
+	if info := resp.FingerPrint.Info; info != "cluster 3.5.0" {
+		t.Fatalf("expected cluster info, got %q", info)
+	}
+}
+
+func TestScanMatchesKafkaMetadataResponseWithoutRegexFallback(t *testing.T) {
+	rawHex := "000167200000000000000003000000020008352e302e302e363400002384ffff000000030008352e302e302e363500002384ffff000000010008352e302e302e363300002384ffff000000030000027b00000009776c616e5f61703336000000000300000000000000000001000000010000000100000001000000010000000000020000000300000001000000030000000100000003000000000001000000020000000100000002000000010000000200000018776c616e5f6576656e747265706f72745f786d79646174610000000003000000000000000000020000000100000002000000010000000200000000000200000001000000010000000100000001000000"
+	payload, err := hex.DecodeString(rawHex)
+	if err != nil {
+		t.Fatalf("failed to decode payload: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+				buf := make([]byte, 1024)
+				_, _ = c.Read(buf)
+				_, _ = c.Write(payload)
+			}(conn)
+		}
+	}()
+
+	engine := New()
+	session := newScanSession(engine, "127.0.0.1", listener.Addr().(*net.TCPAddr).Port, engine.normalizeScanOptions(&ScanOptions{
+		Timeout:  500 * time.Millisecond,
+		Protocol: ScanProtocolTCP,
+		ReadSize: 4096,
+	}))
+
+	probe := engine.probeNameMap["TCP_Kafka"]
+	if probe == nil {
+		t.Fatal("expected TCP_Kafka probe to exist")
+	}
+
+	status, resp := session.getResponse(false, probe)
+
+	if status != Matched {
+		t.Fatalf("expected matched status, got %v", status)
+	}
+	if resp == nil || resp.FingerPrint == nil {
+		t.Fatalf("expected fingerprint response, got %#v", resp)
+	}
+	if service := resp.FingerPrint.Service; service != "kafka" {
+		t.Fatalf("expected service kafka, got %q", service)
+	}
+	if product := resp.FingerPrint.ProductName; product != "Kafka" {
+		t.Fatalf("expected product Kafka, got %q", product)
+	}
+}
+
 func TestEnrichFingerprintByPortMarksKingbaseOnDefaultPort(t *testing.T) {
 	fp := &FingerPrint{
 		Service:     "postgresql",
@@ -433,4 +792,45 @@ func TestScanMatchesKingbaseStartupAuthWhileServerKeepsConnectionOpen(t *testing
 	if probeName := resp.FingerPrint.ProbeName; probeName != "TCP_KB_POSTGRES_STARTUP" {
 		t.Fatalf("expected startup probe match, got %q", probeName)
 	}
+}
+
+func generateSelfSignedCert() (tls.Certificate, error) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "127.0.0.1",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+type peekConn struct {
+	net.Conn
+	reader *bytes.Reader
+}
+
+func (c *peekConn) Read(p []byte) (int, error) {
+	if c.reader != nil && c.reader.Len() > 0 {
+		return c.reader.Read(p)
+	}
+	return c.Conn.Read(p)
 }

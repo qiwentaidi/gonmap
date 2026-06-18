@@ -118,9 +118,6 @@ func main() {
 			scheme = response.FingerPrint.Service
 			raw = response.Raw
 		}
-		if scheme == "unknown" {
-			scheme = gonmap.GuessProtocol(add.Port)
-		}
 
 		retChan <- result{
 			Label:      add.Label,

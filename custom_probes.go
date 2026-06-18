@@ -62,4 +62,10 @@ match postgresql m|^\x52\x00\x00\x00\x08\x00\x00\x00\x03| p/PostgreSQL DB/ i/Cle
 match postgresql m|^\x52\x00\x00\x00\x0c\x00\x00\x00\x05....| p/PostgreSQL DB/ i/MD5 password auth/
 match postgresql m|^\x52....\x00\x00\x00\x0a|s p/PostgreSQL DB/ i/SASL auth/
 match postgresql m|^\x52\x00\x00\x00\x08\x00\x00\x00\x00| p/PostgreSQL DB/ i/Authentication OK/
+##############################NEXT PROBE##############################
+Probe TCP ETCD_VERSION q|GET /version HTTP/1.1\r\nHost: {Host}\r\nUser-Agent: gonmap\r\nAccept: */*\r\n\r\n|
+rarity 8
+ports 2379
+
+match etcd-client m|^HTTP/1\.[01] 200 OK\r\n(?:[^\r\n]+\r\n)*?\r\n\{"etcdserver":"([\d.]+)","etcdcluster":"([\d.]+)"\}\n?$|is p/etcd/ v/$1/ i/cluster $2/
 `

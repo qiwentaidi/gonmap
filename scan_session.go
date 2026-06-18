@@ -1,6 +1,7 @@
 package gonmap
 
 import (
+	"encoding/binary"
 	"net"
 	"strconv"
 	"strings"
@@ -130,10 +131,10 @@ func (s *ScanSession) getRealResponse(probes ...string) (status Status, response
 	if response.FingerPrint.Service == "ssl" {
 		status, response := s.getResponseBySSLSecondProbes()
 		if status == Matched {
-			return Matched, response
+			return s.refineMatchedResponse(Matched, response)
 		}
 	}
-	return status, response
+	return s.refineMatchedResponse(status, response)
 }
 
 func (s *ScanSession) getResponseBySSLSecondProbes() (status Status, response *Response) {
@@ -153,6 +154,74 @@ func (s *ScanSession) getResponseBySSLSecondProbes() (status Status, response *R
 func (s *ScanSession) getResponseByHTTPS() (status Status, response *Response) {
 	httpRequest := s.engine.probeNameMap["TCP_GetRequest"]
 	return s.getResponse(true, httpRequest)
+}
+
+func (s *ScanSession) refineMatchedResponse(status Status, response *Response) (Status, *Response) {
+	if status != Matched {
+		return status, response
+	}
+
+	if s.shouldRefineHTTPS(response) {
+		refinedStatus, refinedResponse := s.getResponseByHTTPS()
+		if refinedStatus == Matched && refinedResponse != nil && refinedResponse.FingerPrint != nil {
+			if refinedResponse.FingerPrint.Service == "http" {
+				refinedResponse.FingerPrint.Service = "https"
+			}
+			if refinedResponse.FingerPrint.Service == "https" {
+				return refinedStatus, refinedResponse
+			}
+		}
+	}
+
+	if s.shouldRefineEtcd(response) {
+		etcdProbe := s.engine.probeNameMap["TCP_ETCD_VERSION"]
+		if etcdProbe != nil {
+			refinedStatus, refinedResponse := s.getResponse(response.TLS, etcdProbe)
+			if refinedStatus == Matched && refinedResponse != nil && refinedResponse.FingerPrint != nil &&
+				refinedResponse.FingerPrint.Service == "etcd-client" {
+				return refinedStatus, refinedResponse
+			}
+		}
+	}
+
+	if s.shouldRefineDocker(response) {
+		dockerProbe := s.engine.probeNameMap["TCP_docker"]
+		if dockerProbe == nil {
+			return status, response
+		}
+
+		refinedStatus, refinedResponse := s.getResponse(response.TLS, dockerProbe)
+		if refinedStatus == Matched && refinedResponse != nil && refinedResponse.FingerPrint != nil &&
+			refinedResponse.FingerPrint.ProductName != "" {
+			return refinedStatus, refinedResponse
+		}
+	}
+	return status, response
+}
+
+func (s *ScanSession) shouldRefineDocker(response *Response) bool {
+	return response != nil &&
+		response.FingerPrint != nil &&
+		response.FingerPrint.Service == "docker" &&
+		response.FingerPrint.ProductName == ""
+}
+
+func (s *ScanSession) shouldRefineHTTPS(response *Response) bool {
+	return response != nil &&
+		response.FingerPrint != nil &&
+		response.FingerPrint.Service == "http" &&
+		(strings.Contains(response.Raw, "Client sent an HTTP request to an HTTPS server.") ||
+			strings.Contains(response.Raw, "The plain HTTP request was sent to HTTPS port") ||
+			strings.Contains(response.Raw, "You're speaking plain HTTP to an SSL-enabled server port"))
+}
+
+func (s *ScanSession) shouldRefineEtcd(response *Response) bool {
+	return response != nil &&
+		response.FingerPrint != nil &&
+		(response.FingerPrint.Service == "http" || response.FingerPrint.Service == "https") &&
+		response.FingerPrint.ProductName == "" &&
+		strings.Contains(response.Raw, "Access-Control-Allow-Headers: accept, content-type, authorization") &&
+		strings.Contains(response.Raw, "page not found")
 }
 
 func (s *ScanSession) getResponseByProbes(probes ...string) (status Status, response *Response) {
@@ -207,6 +276,7 @@ func (s *ScanSession) getResponse(tls bool, p *probe) (Status, *Response) {
 		FingerPrint: &FingerPrint{},
 	}
 	fingerPrint := s.engine.getFinger(text, tls, p.name)
+	enrichFingerprintByProbe(p.name, text, fingerPrint)
 	enrichFingerprintByPort(s.port, fingerPrint)
 	response.FingerPrint = fingerPrint
 
@@ -214,6 +284,16 @@ func (s *ScanSession) getResponse(tls bool, p *probe) (Status, *Response) {
 		return NotMatched, response
 	}
 	return Matched, response
+}
+
+func enrichFingerprintByProbe(probeName string, responseRaw string, fingerPrint *FingerPrint) {
+	if fingerPrint == nil || fingerPrint.Service != "" {
+		return
+	}
+	if probeName == "TCP_Kafka" && looksLikeKafkaMetadata(responseRaw) {
+		fingerPrint.Service = "kafka"
+		fingerPrint.ProductName = "Kafka"
+	}
 }
 
 func enrichFingerprintByPort(port int, fingerPrint *FingerPrint) {
@@ -226,4 +306,80 @@ func enrichFingerprintByPort(port int, fingerPrint *FingerPrint) {
 		fingerPrint.Service = "kingbase"
 		fingerPrint.ProductName = "KingbaseES"
 	}
+}
+
+func looksLikeKafkaMetadata(raw string) bool {
+	data := []byte(raw)
+	if len(data) < 18 {
+		return false
+	}
+
+	payloadSize := int(binary.BigEndian.Uint32(data[0:4]))
+	if payloadSize <= 0 {
+		return false
+	}
+
+	offset := 8 // size + correlation id
+	brokerCount := int(int32(binary.BigEndian.Uint32(data[offset : offset+4])))
+	offset += 4
+	if brokerCount <= 0 || brokerCount > 128 {
+		return false
+	}
+
+	parsedBrokers := 0
+	for i := 0; i < brokerCount && i < 3; i++ {
+		if offset+6 > len(data) {
+			return false
+		}
+		offset += 4 // node id
+
+		hostLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
+		offset += 2
+		if hostLen <= 0 || hostLen > 255 || offset+hostLen+4 > len(data) {
+			return false
+		}
+		host := data[offset : offset+hostLen]
+		if !looksLikeKafkaHost(host) {
+			return false
+		}
+		offset += hostLen
+
+		port := int(int32(binary.BigEndian.Uint32(data[offset : offset+4])))
+		offset += 4
+		if port <= 0 || port > 65535 {
+			return false
+		}
+
+		if offset+2 <= len(data) {
+			rackLen := int(int16(binary.BigEndian.Uint16(data[offset : offset+2])))
+			offset += 2
+			if rackLen >= 0 {
+				if rackLen > 255 || offset+rackLen > len(data) {
+					return false
+				}
+				offset += rackLen
+			}
+		}
+		parsedBrokers++
+	}
+
+	return parsedBrokers > 0
+}
+
+func looksLikeKafkaHost(host []byte) bool {
+	if len(host) == 0 {
+		return false
+	}
+	for _, b := range host {
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') {
+			continue
+		}
+		switch b {
+		case '.', '-', '_', ':':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }
