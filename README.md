@@ -335,8 +335,8 @@ DiscoveryOptions: lib.PortDiscoveryOptions{
 
 ```go
 results := sdk.ScanHostsPorts([]string{
-	"dev-www.caocaokeji.cn",
-	"sandbox-center.caocaokeji.cn",
+	"example.com",
+	"example.net",
 }, lib.ExpandPortRange(1, 65535), &lib.BatchScanOptions{})
 ```
 
