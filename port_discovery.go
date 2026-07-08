@@ -11,11 +11,22 @@ import (
 const (
 	defaultDiscoveryTimeout     = time.Second
 	defaultDiscoveryConcurrency = 1024
+	defaultSYNDiscoveryRate     = 1500
+)
+
+type PortDiscoveryMode string
+
+const (
+	PortDiscoveryModeConnect PortDiscoveryMode = "connect"
+	PortDiscoveryModeSYN     PortDiscoveryMode = "syn"
 )
 
 type PortDiscoveryOptions struct {
-	Timeout     time.Duration
-	Concurrency int
+	Timeout            time.Duration
+	Concurrency        int
+	Mode               PortDiscoveryMode
+	Rate               int
+	DisableSYNFallback bool
 }
 
 type OpenPort struct {
@@ -36,6 +47,25 @@ func normalizePortDiscoveryOptions(options *PortDiscoveryOptions) PortDiscoveryO
 	}
 	if options.Concurrency > 0 {
 		normalized.Concurrency = options.Concurrency
+	}
+	if options.Mode != "" {
+		normalized.Mode = options.Mode
+	}
+	if options.Rate > 0 {
+		normalized.Rate = options.Rate
+	}
+	if options.DisableSYNFallback {
+		normalized.DisableSYNFallback = true
+	}
+	if normalized.Mode == "" {
+		normalized.Mode = PortDiscoveryModeConnect
+	}
+	if normalized.Rate <= 0 {
+		if normalized.Mode == PortDiscoveryModeSYN {
+			normalized.Rate = defaultSYNDiscoveryRate
+		} else {
+			normalized.Rate = normalized.Concurrency
+		}
 	}
 	return normalized
 }
@@ -64,6 +94,19 @@ func DiscoverOpenPorts(hosts []string, ports []int, options *PortDiscoveryOption
 	}
 
 	opts := normalizePortDiscoveryOptions(options)
+	if opts.Mode == PortDiscoveryModeSYN {
+		openPorts, err := discoverOpenPortsSYN(hosts, ports, opts)
+		if err == nil {
+			return openPorts
+		}
+		if opts.DisableSYNFallback {
+			return nil
+		}
+	}
+	return discoverOpenPortsConnect(hosts, ports, opts)
+}
+
+func discoverOpenPortsConnect(hosts []string, ports []int, opts PortDiscoveryOptions) []OpenPort {
 	type job struct {
 		host string
 		port int

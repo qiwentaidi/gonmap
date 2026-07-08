@@ -129,6 +129,14 @@ status, resp := sdk.Scan("114.132.250.138", 80, &lib.ScanOptions{
 - `DisableFingerprint`
 - `Protocol`
 
+[`lib.PortDiscoveryOptions`]() 当前支持：
+
+- `Timeout`
+- `Concurrency`
+- `Mode`
+- `Rate`
+- `DisableSYNFallback`
+
 ## 扫描协议
 
 协议常量在 [`lib/sdk.go`]() 中导出：
@@ -153,6 +161,19 @@ status, resp := sdk.Scan("114.132.250.138", 53, &lib.ScanOptions{
 	Protocol: lib.ScanProtocolUDP,
 })
 ```
+
+## 端口发现模式
+
+端口发现模式常量在 [`lib/sdk.go`]() 中导出：
+
+```go
+lib.PortDiscoveryModeConnect
+lib.PortDiscoveryModeSYN
+```
+
+默认使用 `connect`，也就是普通 TCP connect 检测。`syn` 模式只用于批量端口发现阶段，发现开放端口后，后续服务指纹识别仍然会走 `ScanOptions.Protocol: lib.ScanProtocolTCP` 的现有 TCP 探针流程。
+
+SYN 模式使用 raw IPv4 socket，需要 root/CAP_NET_RAW 等系统权限；如果 raw socket 不可用，默认会回退到 connect 发现。需要严格失败时可以设置 `DisableSYNFallback: true`。
 
 ## 返回值说明
 
@@ -258,9 +279,24 @@ func main() {
 - 第一阶段只做 TCP connect，速度快、带宽低
 - 第二阶段只对开放端口做 `gonmap` 指纹识别
 
-如果目标很多，优先调这两个参数：
+如果希望第一阶段改成 SYN 发现：
+
+```go
+openPorts := sdk.DiscoverOpenPorts([]string{"127.0.0.1"}, ports, &lib.PortDiscoveryOptions{
+	Mode:    lib.PortDiscoveryModeSYN,
+	Timeout: 800 * time.Millisecond,
+	Rate:    3000,
+})
+```
+
+如果目标很多，connect 模式优先调这两个参数：
 
 - `PortDiscoveryOptions.Concurrency`
+- `PortDiscoveryOptions.Timeout`
+
+SYN 模式优先调：
+
+- `PortDiscoveryOptions.Rate`
 - `PortDiscoveryOptions.Timeout`
 
 如果你希望直接以“目标组 + 端口组”的方式跑完整流程，可以使用新的批量入口：
@@ -283,6 +319,16 @@ fmt.Println("stable:", result.StablePorts)
 fmt.Println("suspicious:", result.SuspiciousPorts)
 fmt.Println("wrapped:", result.LikelyWrappedPorts)
 fmt.Println("likely_noise:", result.LikelyNoise, result.NoiseReason)
+```
+
+SYN 发现版本只需要替换 `DiscoveryOptions`：
+
+```go
+DiscoveryOptions: lib.PortDiscoveryOptions{
+	Mode:    lib.PortDiscoveryModeSYN,
+	Timeout: 800 * time.Millisecond,
+	Rate:    3000,
+}
 ```
 
 多目标版本：

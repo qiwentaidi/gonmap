@@ -12,12 +12,18 @@ type FingerPrint = gonmap.FingerPrint
 type ScanOptions = gonmap.ScanOptions
 type ScanProtocol = gonmap.ScanProtocol
 type PortDiscoveryOptions = gonmap.PortDiscoveryOptions
+type PortDiscoveryMode = gonmap.PortDiscoveryMode
 type OpenPort = gonmap.OpenPort
 
 const (
 	ScanProtocolAuto = gonmap.ScanProtocolAuto
 	ScanProtocolTCP  = gonmap.ScanProtocolTCP
 	ScanProtocolUDP  = gonmap.ScanProtocolUDP
+)
+
+const (
+	PortDiscoveryModeConnect = gonmap.PortDiscoveryModeConnect
+	PortDiscoveryModeSYN     = gonmap.PortDiscoveryModeSYN
 )
 
 const (
@@ -63,12 +69,12 @@ func New(options *Options) *SDK {
 	sdk := &SDK{engine: engine}
 	if options != nil {
 		sdk.defaultScanOptions = ScanOptions{
-			Timeout:      options.Timeout,
-			ProxyURL:     options.ProxyURL,
-			ReadSize:     options.ReadSize,
-			DeepIdentify: options.DeepIdentify,
+			Timeout:            options.Timeout,
+			ProxyURL:           options.ProxyURL,
+			ReadSize:           options.ReadSize,
+			DeepIdentify:       options.DeepIdentify,
 			DisableFingerprint: options.DisableFingerprint,
-			Protocol:     options.Protocol,
+			Protocol:           options.Protocol,
 		}
 	}
 

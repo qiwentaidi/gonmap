@@ -8,22 +8,22 @@ import (
 )
 
 const (
-	defaultFingerprintWorkers        = 64
-	defaultSuspiciousOpenThreshold   = 128
-	defaultSuspiciousHighPortStart   = 10000
-	defaultSuspiciousOpenRatio       = 0.60
-	minRepeatedHTTPNoisePorts        = 3
-	massGenericOpenThreshold         = 128
-	massGenericOpenRatio             = 0.80
+	defaultFingerprintWorkers      = 64
+	defaultSuspiciousOpenThreshold = 128
+	defaultSuspiciousHighPortStart = 10000
+	defaultSuspiciousOpenRatio     = 0.60
+	minRepeatedHTTPNoisePorts      = 3
+	massGenericOpenThreshold       = 128
+	massGenericOpenRatio           = 0.80
 )
 
 type BatchScanOptions struct {
-	DiscoveryOptions           PortDiscoveryOptions
-	FingerprintOptions         ScanOptions
-	FingerprintWorkers         int
-	SuspiciousOpenThreshold    int
-	SuspiciousHighPortStart    int
-	SuspiciousOpenRatio        float64
+	DiscoveryOptions        PortDiscoveryOptions
+	FingerprintOptions      ScanOptions
+	FingerprintWorkers      int
+	SuspiciousOpenThreshold int
+	SuspiciousHighPortStart int
+	SuspiciousOpenRatio     float64
 }
 
 type BatchPortResult struct {
@@ -37,14 +37,14 @@ type BatchPortResult struct {
 }
 
 type HostBatchResult struct {
-	Host             string
-	OpenPorts        []int
-	Results          []BatchPortResult
-	StablePorts      []int
-	SuspiciousPorts  []int
+	Host               string
+	OpenPorts          []int
+	Results            []BatchPortResult
+	StablePorts        []int
+	SuspiciousPorts    []int
 	LikelyWrappedPorts []int
-	LikelyNoise      bool
-	NoiseReason      string
+	LikelyNoise        bool
+	NoiseReason        string
 }
 
 type normalizedBatchScanOptions struct {
@@ -75,6 +75,15 @@ func normalizeBatchScanOptions(options *BatchScanOptions) normalizedBatchScanOpt
 	}
 	if options.DiscoveryOptions.Concurrency > 0 {
 		normalized.discoveryOptions.Concurrency = options.DiscoveryOptions.Concurrency
+	}
+	if options.DiscoveryOptions.Mode != "" {
+		normalized.discoveryOptions.Mode = options.DiscoveryOptions.Mode
+	}
+	if options.DiscoveryOptions.Rate > 0 {
+		normalized.discoveryOptions.Rate = options.DiscoveryOptions.Rate
+	}
+	if options.DiscoveryOptions.DisableSYNFallback {
+		normalized.discoveryOptions.DisableSYNFallback = true
 	}
 	normalized.fingerprintOptions = options.FingerprintOptions
 	if options.FingerprintWorkers > 0 {
