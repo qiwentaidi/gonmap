@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync"
@@ -62,14 +63,20 @@ type synPendingProbe struct {
 	hosts []string
 }
 
+type synPacketSender interface {
+	sendTCP(remoteIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags uint8, window uint16) (net.IP, error)
+	close()
+}
+
 type synDiscoveryScanner struct {
-	conn       *ipv4.RawConn
-	pcap       []*pcap.Handle
-	timeout    time.Duration
-	rate       int
-	nextPort   uint16
-	randSource *rand.Rand
-	srcIPCache map[string]net.IP
+	conn         *ipv4.RawConn
+	packetSender synPacketSender
+	pcap         []*pcap.Handle
+	timeout      time.Duration
+	rate         int
+	nextPort     uint16
+	randSource   *rand.Rand
+	srcIPCache   map[string]net.IP
 
 	mu      sync.Mutex
 	pending map[synProbeKey]synPendingProbe
@@ -81,7 +88,7 @@ type synDiscoveryScanner struct {
 }
 
 func discoverOpenPortsSYN(hosts []string, ports []int, opts PortDiscoveryOptions) ([]OpenPort, error) {
-	hostIPs, fallbackHosts := resolveSYNDiscoveryHosts(hosts, opts.Timeout)
+	hostIPs := resolveSYNDiscoveryHosts(hosts, opts.Timeout)
 	if len(hostIPs) == 0 {
 		return nil, errSYNDiscoveryUnavailable
 	}
@@ -91,26 +98,38 @@ func discoverOpenPortsSYN(hosts []string, ports []int, opts PortDiscoveryOptions
 		return nil, errSYNDiscoveryUnavailable
 	}
 
-	rawConn, err := openSYNRawConn()
+	scanner, err := newSYNDiscoveryScannerForPlatform(opts.Timeout, opts.Rate)
 	if err != nil {
 		return nil, err
 	}
+	defer scanner.close()
 
-	scanner := newSYNDiscoveryScanner(rawConn, opts.Timeout, opts.Rate)
 	err = scanner.scan(tasks)
-	_ = rawConn.Close()
 	if err != nil {
 		return nil, err
 	}
 
 	openPorts := scanner.openPorts()
-	if len(fallbackHosts) > 0 && !opts.DisableSYNFallback {
-		openPorts = mergeOpenPorts(openPorts, discoverOpenPortsConnect(fallbackHosts, ports, opts))
-	}
 	return sortOpenPorts(openPorts), nil
 }
 
-func newSYNDiscoveryScanner(conn *ipv4.RawConn, timeout time.Duration, rate int) *synDiscoveryScanner {
+func newSYNDiscoveryScannerForPlatform(timeout time.Duration, rate int) (*synDiscoveryScanner, error) {
+	if runtime.GOOS == "windows" {
+		sender, err := newSYNLayer2PacketSender(timeout)
+		if err != nil {
+			return nil, err
+		}
+		return newSYNDiscoveryScanner(nil, sender, timeout, rate), nil
+	}
+
+	rawConn, err := openSYNRawConn()
+	if err != nil {
+		return nil, err
+	}
+	return newSYNDiscoveryScanner(rawConn, nil, timeout, rate), nil
+}
+
+func newSYNDiscoveryScanner(conn *ipv4.RawConn, sender synPacketSender, timeout time.Duration, rate int) *synDiscoveryScanner {
 	if timeout <= 0 {
 		timeout = defaultDiscoveryTimeout
 	}
@@ -119,25 +138,28 @@ func newSYNDiscoveryScanner(conn *ipv4.RawConn, timeout time.Duration, rate int)
 	}
 	pcapHandles := openSYNPCAPHandles()
 	return &synDiscoveryScanner{
-		conn:       conn,
-		pcap:       pcapHandles,
-		timeout:    timeout,
-		rate:       rate,
-		nextPort:   synSourcePortMin,
-		randSource: rand.New(rand.NewSource(time.Now().UnixNano())),
-		srcIPCache: make(map[string]net.IP),
-		pending:    make(map[synProbeKey]synPendingProbe),
-		open:       make(map[string]OpenPort),
-		done:       make(chan struct{}),
+		conn:         conn,
+		packetSender: sender,
+		pcap:         pcapHandles,
+		timeout:      timeout,
+		rate:         rate,
+		nextPort:     synSourcePortMin,
+		randSource:   rand.New(rand.NewSource(time.Now().UnixNano())),
+		srcIPCache:   make(map[string]net.IP),
+		pending:      make(map[synProbeKey]synPendingProbe),
+		open:         make(map[string]OpenPort),
+		done:         make(chan struct{}),
 	}
 }
 
 func (s *synDiscoveryScanner) scan(tasks []synScanTask) error {
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.recv()
-	}()
+	if s.conn != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.recv()
+		}()
+	}
 	for _, handle := range s.pcap {
 		s.wg.Add(1)
 		go func(handle *pcap.Handle) {
@@ -193,9 +215,20 @@ func (s *synDiscoveryScanner) scan(tasks []synScanTask) error {
 
 func (s *synDiscoveryScanner) stopReceivers() {
 	close(s.done)
-	_ = s.conn.SetReadDeadline(time.Now())
+	if s.conn != nil {
+		_ = s.conn.SetReadDeadline(time.Now())
+	}
 	for _, handle := range s.pcap {
 		handle.Close()
+	}
+}
+
+func (s *synDiscoveryScanner) close() {
+	if s.conn != nil {
+		_ = s.conn.Close()
+	}
+	if s.packetSender != nil {
+		s.packetSender.close()
 	}
 }
 
@@ -221,19 +254,23 @@ func (s *synDiscoveryScanner) sendSYN(task synScanTask) error {
 	s.mu.Unlock()
 
 	seq := uint32(s.randSource.Int31())
-	segment := buildTCPSegment(srcPort, dstPort, seq, 0, tcpFlagSYN, 64240, srcIP, task.ip)
-	header := &ipv4.Header{
-		Version:  ipv4.Version,
-		Len:      ipv4.HeaderLen,
-		TotalLen: ipv4.HeaderLen + len(segment),
-		TTL:      64,
-		Protocol: tcpProtocolNumber,
-		Flags:    ipv4.DontFragment,
-		Src:      srcIP,
-		Dst:      task.ip,
+	if s.packetSender != nil {
+		_, err = s.packetSender.sendTCP(task.ip, srcPort, dstPort, seq, 0, tcpFlagSYN, 64240)
+	} else {
+		segment := buildTCPSegment(srcPort, dstPort, seq, 0, tcpFlagSYN, 64240, srcIP, task.ip)
+		header := &ipv4.Header{
+			Version:  ipv4.Version,
+			Len:      ipv4.HeaderLen,
+			TotalLen: ipv4.HeaderLen + len(segment),
+			TTL:      64,
+			Protocol: tcpProtocolNumber,
+			Flags:    ipv4.DontFragment,
+			Src:      srcIP,
+			Dst:      task.ip,
+		}
+		err = s.writeIPv4(header, segment)
 	}
-
-	if err := s.writeIPv4(header, segment); err != nil {
+	if err != nil {
 		s.mu.Lock()
 		delete(s.pending, key)
 		s.mu.Unlock()
@@ -325,6 +362,11 @@ func (s *synDiscoveryScanner) sendRST(localIP, remoteIP net.IP, localPort, remot
 	remoteIP = remoteIP.To4()
 	if localIP == nil || remoteIP == nil {
 		return nil
+	}
+
+	if s.packetSender != nil {
+		_, err := s.packetSender.sendTCP(remoteIP, localPort, remotePort, remoteAck, remoteSeq+1, tcpFlagRST|tcpFlagACK, 0)
+		return err
 	}
 
 	segment := buildTCPSegment(localPort, remotePort, remoteAck, remoteSeq+1, tcpFlagRST|tcpFlagACK, 0, localIP, remoteIP)
@@ -467,10 +509,10 @@ func (s *synDiscoveryScanner) openPorts() []OpenPort {
 	return openPorts
 }
 
-func resolveSYNDiscoveryHosts(hosts []string, timeout time.Duration) ([]struct {
+func resolveSYNDiscoveryHosts(hosts []string, timeout time.Duration) []struct {
 	host string
 	ip   net.IP
-}, []string) {
+} {
 	if timeout <= 0 {
 		timeout = defaultDiscoveryTimeout
 	}
@@ -482,7 +524,6 @@ func resolveSYNDiscoveryHosts(hosts []string, timeout time.Duration) ([]struct {
 		host string
 		ip   net.IP
 	}, 0, len(hosts))
-	fallbackHosts := make([]string, 0)
 	seen := make(map[string]struct{})
 
 	for _, host := range hosts {
@@ -492,7 +533,6 @@ func resolveSYNDiscoveryHosts(hosts []string, timeout time.Duration) ([]struct {
 		if parsed := net.ParseIP(host); parsed != nil {
 			ip4 := parsed.To4()
 			if ip4 == nil {
-				fallbackHosts = append(fallbackHosts, host)
 				continue
 			}
 			key := host + "\x00" + ip4.String()
@@ -510,11 +550,9 @@ func resolveSYNDiscoveryHosts(hosts []string, timeout time.Duration) ([]struct {
 		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 		cancel()
 		if err != nil {
-			fallbackHosts = append(fallbackHosts, host)
 			continue
 		}
 
-		added := false
 		for _, addr := range addrs {
 			ip4 := addr.IP.To4()
 			if ip4 == nil {
@@ -529,13 +567,9 @@ func resolveSYNDiscoveryHosts(hosts []string, timeout time.Duration) ([]struct {
 				ip   net.IP
 			}{host: host, ip: ip4})
 			seen[key] = struct{}{}
-			added = true
-		}
-		if !added {
-			fallbackHosts = append(fallbackHosts, host)
 		}
 	}
-	return resolved, fallbackHosts
+	return resolved
 }
 
 func buildSYNScanTasks(hostIPs []struct {
@@ -636,20 +670,6 @@ func addChecksumBytes(sum uint32, data []byte) uint32 {
 		sum += uint32(data[0]) << 8
 	}
 	return sum
-}
-
-func mergeOpenPorts(left, right []OpenPort) []OpenPort {
-	merged := make([]OpenPort, 0, len(left)+len(right))
-	seen := make(map[string]struct{}, len(left)+len(right))
-	for _, item := range append(left, right...) {
-		key := item.Host + "\x00" + strconv.Itoa(item.Port)
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		merged = append(merged, item)
-	}
-	return merged
 }
 
 func sortOpenPorts(openPorts []OpenPort) []OpenPort {

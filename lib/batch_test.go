@@ -152,9 +152,8 @@ func TestScanHostPortsRespectsSDKFilter(t *testing.T) {
 func TestNormalizeBatchScanOptionsKeepsDiscoveryMode(t *testing.T) {
 	normalized := normalizeBatchScanOptions(&BatchScanOptions{
 		DiscoveryOptions: PortDiscoveryOptions{
-			Mode:               PortDiscoveryModeSYN,
-			Rate:               3000,
-			DisableSYNFallback: true,
+			Mode: PortDiscoveryModeSYN,
+			Rate: 3000,
 		},
 	})
 
@@ -163,9 +162,6 @@ func TestNormalizeBatchScanOptionsKeepsDiscoveryMode(t *testing.T) {
 	}
 	if normalized.discoveryOptions.Rate != 3000 {
 		t.Fatalf("expected syn rate 3000, got %d", normalized.discoveryOptions.Rate)
-	}
-	if !normalized.discoveryOptions.DisableSYNFallback {
-		t.Fatalf("expected syn fallback to be disabled")
 	}
 }
 

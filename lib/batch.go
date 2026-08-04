@@ -82,9 +82,6 @@ func normalizeBatchScanOptions(options *BatchScanOptions) normalizedBatchScanOpt
 	if options.DiscoveryOptions.Rate > 0 {
 		normalized.discoveryOptions.Rate = options.DiscoveryOptions.Rate
 	}
-	if options.DiscoveryOptions.DisableSYNFallback {
-		normalized.discoveryOptions.DisableSYNFallback = true
-	}
 	normalized.fingerprintOptions = options.FingerprintOptions
 	if options.FingerprintWorkers > 0 {
 		normalized.fingerprintWorkers = options.FingerprintWorkers

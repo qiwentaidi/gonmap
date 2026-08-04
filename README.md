@@ -135,7 +135,6 @@ status, resp := sdk.Scan("114.132.250.138", 80, &lib.ScanOptions{
 - `Concurrency`
 - `Mode`
 - `Rate`
-- `DisableSYNFallback`
 
 ## 扫描协议
 
@@ -173,7 +172,7 @@ lib.PortDiscoveryModeSYN
 
 默认使用 `connect`，也就是普通 TCP connect 检测。`syn` 模式只用于批量端口发现阶段，发现开放端口后，后续服务指纹识别仍然会走 `ScanOptions.Protocol: lib.ScanProtocolTCP` 的现有 TCP 探针流程。
 
-SYN 模式使用 raw IPv4 socket，需要 root/CAP_NET_RAW 等系统权限；如果 raw socket 不可用，默认会回退到 connect 发现。需要严格失败时可以设置 `DisableSYNFallback: true`。
+SYN 模式在 Linux/macOS 上使用 raw IPv4 socket，需要 root/CAP_NET_RAW 等系统权限；Windows 上使用 Npcap/libpcap 二层发包，需要安装 Npcap 并以具备抓包发包权限的方式运行。SYN 模式不会在初始化、发包或解析失败时回退到 connect，避免结果来源产生歧义。
 
 ## 返回值说明
 

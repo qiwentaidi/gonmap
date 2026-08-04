@@ -18,7 +18,6 @@ var (
 	benchBatchDiscoveryTimeout   = flag.Duration("discovery-timeout", 10*time.Second, "discovery wait/timeout")
 	benchBatchDiscoveryRate      = flag.Int("discovery-rate", 3000, "syn discovery packet rate")
 	benchBatchDiscoveryWorkers   = flag.Int("discovery-workers", 4096, "connect discovery concurrency")
-	benchBatchAllowSYNFallback   = flag.Bool("syn-fallback", false, "allow syn discovery to fall back to connect")
 	benchBatchFingerprintTimeout = flag.Duration("fingerprint-timeout", 3*time.Second, "per-port fingerprint timeout")
 	benchBatchFingerprintWorkers = flag.Int("fingerprint-workers", 64, "fingerprint worker count")
 )
@@ -38,11 +37,10 @@ func TestMeasureBatchScanSpeed(t *testing.T) {
 	start := time.Now()
 	options := &BatchScanOptions{
 		DiscoveryOptions: PortDiscoveryOptions{
-			Timeout:            *benchBatchDiscoveryTimeout,
-			Concurrency:        *benchBatchDiscoveryWorkers,
-			Mode:               discoveryMode,
-			Rate:               *benchBatchDiscoveryRate,
-			DisableSYNFallback: discoveryMode == PortDiscoveryModeSYN && !*benchBatchAllowSYNFallback,
+			Timeout:     *benchBatchDiscoveryTimeout,
+			Concurrency: *benchBatchDiscoveryWorkers,
+			Mode:        discoveryMode,
+			Rate:        *benchBatchDiscoveryRate,
 		},
 		FingerprintOptions: ScanOptions{
 			Timeout:  *benchBatchFingerprintTimeout,

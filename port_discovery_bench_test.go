@@ -16,7 +16,6 @@ var (
 	benchTimeout     = flag.Duration("timeout", 800*time.Millisecond, "per-port discovery timeout")
 	benchConcurrency = flag.Int("concurrency", 4096, "connect discovery concurrency")
 	benchRate        = flag.Int("rate", 3000, "syn discovery packet rate")
-	benchSYNFallback = flag.Bool("syn-fallback", false, "allow syn discovery to fall back to connect")
 )
 
 func TestMeasureDiscoverySpeed(t *testing.T) {
@@ -31,11 +30,10 @@ func TestMeasureDiscoverySpeed(t *testing.T) {
 	}
 
 	options := &PortDiscoveryOptions{
-		Timeout:            *benchTimeout,
-		Concurrency:        *benchConcurrency,
-		Mode:               mode,
-		Rate:               *benchRate,
-		DisableSYNFallback: mode == PortDiscoveryModeSYN && !*benchSYNFallback,
+		Timeout:     *benchTimeout,
+		Concurrency: *benchConcurrency,
+		Mode:        mode,
+		Rate:        *benchRate,
 	}
 
 	start := time.Now()
@@ -43,7 +41,7 @@ func TestMeasureDiscoverySpeed(t *testing.T) {
 		openPorts []OpenPort
 		err       error
 	)
-	if mode == PortDiscoveryModeSYN && options.DisableSYNFallback {
+	if mode == PortDiscoveryModeSYN {
 		openPorts, err = discoverOpenPortsSYN([]string{*benchTarget}, ports, *options)
 		if err != nil {
 			t.Fatalf("syn discovery failed: %v", err)
@@ -55,7 +53,7 @@ func TestMeasureDiscoverySpeed(t *testing.T) {
 	portsPerSecond := float64(len(ports)) / elapsed.Seconds()
 
 	t.Logf(
-		"target=%s mode=%s ports=%d range=%d-%d open=%d elapsed=%s ports_per_second=%.0f timeout=%s concurrency=%d rate=%d syn_fallback=%t",
+		"target=%s mode=%s ports=%d range=%d-%d open=%d elapsed=%s ports_per_second=%.0f timeout=%s concurrency=%d rate=%d",
 		*benchTarget,
 		mode,
 		len(ports),
@@ -67,6 +65,5 @@ func TestMeasureDiscoverySpeed(t *testing.T) {
 		*benchTimeout,
 		*benchConcurrency,
 		*benchRate,
-		*benchSYNFallback,
 	)
 }
