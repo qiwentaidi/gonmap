@@ -1,7 +1,9 @@
 package gonmap
 
 import (
+	"fmt"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"sync"
@@ -22,11 +24,10 @@ const (
 )
 
 type PortDiscoveryOptions struct {
-	Timeout            time.Duration
-	Concurrency        int
-	Mode               PortDiscoveryMode
-	Rate               int
-	DisableSYNFallback bool
+	Timeout     time.Duration
+	Concurrency int
+	Mode        PortDiscoveryMode
+	Rate        int
 }
 
 type OpenPort struct {
@@ -53,9 +54,6 @@ func normalizePortDiscoveryOptions(options *PortDiscoveryOptions) PortDiscoveryO
 	}
 	if options.Rate > 0 {
 		normalized.Rate = options.Rate
-	}
-	if options.DisableSYNFallback {
-		normalized.DisableSYNFallback = true
 	}
 	if normalized.Mode == "" {
 		normalized.Mode = PortDiscoveryModeConnect
@@ -99,9 +97,8 @@ func DiscoverOpenPorts(hosts []string, ports []int, options *PortDiscoveryOption
 		if err == nil {
 			return openPorts
 		}
-		if opts.DisableSYNFallback {
-			return nil
-		}
+		fmt.Fprintf(os.Stderr, "syn discovery failed: %v\n", err)
+		return nil
 	}
 	return discoverOpenPortsConnect(hosts, ports, opts)
 }

@@ -2,7 +2,10 @@ package gonmap
 
 import (
 	"errors"
+	"io"
 	"net"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,7 +43,7 @@ func TestDiscoverOpenPortsFindsListeningSocket(t *testing.T) {
 	}
 }
 
-func TestDiscoverOpenPortsSYNFallsBackToConnect(t *testing.T) {
+func TestDiscoverOpenPortsSYNDoesNotFallBackToConnect(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
@@ -56,36 +59,47 @@ func TestDiscoverOpenPortsSYNFallsBackToConnect(t *testing.T) {
 	})
 
 	port := listener.Addr().(*net.TCPAddr).Port
-	results := DiscoverOpenPorts([]string{"127.0.0.1"}, []int{port, port + 1}, &PortDiscoveryOptions{
-		Timeout:     200 * time.Millisecond,
-		Concurrency: 8,
-		Mode:        PortDiscoveryModeSYN,
+	output := captureStderr(t, func() {
+		results := DiscoverOpenPorts([]string{"127.0.0.1"}, []int{port, port + 1}, &PortDiscoveryOptions{
+			Timeout:     200 * time.Millisecond,
+			Concurrency: 8,
+			Mode:        PortDiscoveryModeSYN,
+		})
+
+		if len(results) != 0 {
+			t.Fatalf("expected no results when syn is unavailable, got %#v", results)
+		}
 	})
 
-	if len(results) != 1 {
-		t.Fatalf("expected 1 open port from connect fallback, got %#v", results)
-	}
-	if results[0].Host != "127.0.0.1" || results[0].Port != port {
-		t.Fatalf("unexpected result: %#v", results[0])
+	if !strings.Contains(output, "syn discovery failed: raw socket unavailable") {
+		t.Fatalf("expected syn discovery error in stderr, got %q", output)
 	}
 }
 
-func TestDiscoverOpenPortsSYNCanDisableFallback(t *testing.T) {
-	originalOpenSYNRawConn := openSYNRawConn
-	openSYNRawConn = func() (*ipv4.RawConn, error) {
-		return nil, errors.New("raw socket unavailable")
-	}
-	t.Cleanup(func() {
-		openSYNRawConn = originalOpenSYNRawConn
-	})
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
 
-	results := DiscoverOpenPorts([]string{"127.0.0.1"}, []int{1}, &PortDiscoveryOptions{
-		Timeout:            200 * time.Millisecond,
-		Mode:               PortDiscoveryModeSYN,
-		DisableSYNFallback: true,
-	})
-
-	if len(results) != 0 {
-		t.Fatalf("expected no results when syn is unavailable and fallback is disabled, got %#v", results)
+	originalStderr := os.Stderr
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create stderr pipe: %v", err)
 	}
+	os.Stderr = writePipe
+	defer func() {
+		os.Stderr = originalStderr
+	}()
+
+	fn()
+
+	if err := writePipe.Close(); err != nil {
+		t.Fatalf("failed to close stderr pipe: %v", err)
+	}
+	output, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatalf("failed to read stderr: %v", err)
+	}
+	if err := readPipe.Close(); err != nil {
+		t.Fatalf("failed to close stderr read pipe: %v", err)
+	}
+	return string(output)
 }
