@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"context"
 	"time"
 
 	"github.com/qiwentaidi/gonmap"
@@ -82,6 +83,13 @@ func New(options *Options) *SDK {
 }
 
 func (s *SDK) Scan(host string, port int, options *ScanOptions) (Status, *Response) {
+	return s.ScanWithContext(context.Background(), host, port, options)
+}
+
+func (s *SDK) ScanWithContext(ctx context.Context, host string, port int, options *ScanOptions) (Status, *Response) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	merged := s.defaultScanOptions
 	if options != nil {
 		if options.Timeout > 0 {
@@ -103,7 +111,7 @@ func (s *SDK) Scan(host string, port int, options *ScanOptions) (Status, *Respon
 			merged.Protocol = options.Protocol
 		}
 	}
-	return s.engine.ScanWithOptions(host, port, &merged)
+	return s.engine.ScanWithOptionsContext(ctx, host, port, &merged)
 }
 
 func (s *SDK) Engine() *gonmap.Nmap {
@@ -111,7 +119,11 @@ func (s *SDK) Engine() *gonmap.Nmap {
 }
 
 func (s *SDK) DiscoverOpenPorts(hosts []string, ports []int, options *PortDiscoveryOptions) []OpenPort {
-	return gonmap.DiscoverOpenPorts(hosts, ports, options)
+	return s.DiscoverOpenPortsWithContext(context.Background(), hosts, ports, options)
+}
+
+func (s *SDK) DiscoverOpenPortsWithContext(ctx context.Context, hosts []string, ports []int, options *PortDiscoveryOptions) []OpenPort {
+	return gonmap.DiscoverOpenPortsWithContext(ctx, hosts, ports, options)
 }
 
 func ExpandPortRange(startPort, endPort int) []int {

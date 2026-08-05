@@ -1,6 +1,7 @@
 package gonmap
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 )
 
 type ScanSession struct {
+	ctx       context.Context
 	engine    *Nmap
 	host      string
 	port      int
@@ -19,7 +21,15 @@ type ScanSession struct {
 }
 
 func newScanSession(engine *Nmap, host string, port int, options ScanOptions) *ScanSession {
+	return newScanSessionWithContext(context.Background(), engine, host, port, options)
+}
+
+func newScanSessionWithContext(ctx context.Context, engine *Nmap, host string, port int, options ScanOptions) *ScanSession {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &ScanSession{
+		ctx:       ctx,
 		engine:    engine,
 		host:      host,
 		port:      port,
@@ -29,12 +39,18 @@ func newScanSession(engine *Nmap, host string, port int, options ScanOptions) *S
 }
 
 func (s *ScanSession) scan() (status Status, response *Response) {
+	if s.ctx.Err() != nil {
+		return Closed, nil
+	}
 	if s.options.DisableFingerprint && s.canUseLightweightOpenCheck() {
 		return s.scanOpenOnly()
 	}
 	if s.shouldRunLightweightOpenCheck() {
 		status, response = s.scanOpenOnly()
 		if status == Closed {
+			return Closed, nil
+		}
+		if s.ctx.Err() != nil {
 			return Closed, nil
 		}
 	}
@@ -58,7 +74,8 @@ func (s *ScanSession) scanOpenOnly() (Status, *Response) {
 	if timeout <= 0 {
 		timeout = defaultScanTimeout
 	}
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(s.host, strconv.Itoa(s.port)), timeout)
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(s.ctx, "tcp", net.JoinHostPort(s.host, strconv.Itoa(s.port)))
 	if err != nil {
 		return Closed, nil
 	}
@@ -227,6 +244,9 @@ func (s *ScanSession) shouldRefineEtcd(response *Response) bool {
 func (s *ScanSession) getResponseByProbes(probes ...string) (status Status, response *Response) {
 	var responseNotMatch *Response
 	for _, requestName := range probes {
+		if s.ctx.Err() != nil {
+			return Closed, nil
+		}
 		if _, ok := s.probeUsed[requestName]; ok {
 			continue
 		}
@@ -252,15 +272,21 @@ func (s *ScanSession) getResponseByProbes(probes ...string) (status Status, resp
 }
 
 func (s *ScanSession) getResponse(tls bool, p *probe) (Status, *Response) {
+	if s.ctx.Err() != nil {
+		return Closed, nil
+	}
 	if s.port == 53 && p.protocol == "UDP" {
-		if DnsScan(s.host, s.port) {
+		if DnsScanContext(s.ctx, s.host, s.port) {
 			return Matched, &dnsResponse
 		}
 		return Closed, nil
 	}
 
-	text, tls, err := p.scan(s.host, s.port, tls, s.options.Timeout, s.options.ReadSize, s.options.ProxyURL)
+	text, tls, err := p.scanWithContext(s.ctx, s.host, s.port, tls, s.options.Timeout, s.options.ReadSize, s.options.ProxyURL)
 	if err != nil {
+		if s.ctx.Err() != nil {
+			return Closed, nil
+		}
 		if strings.Contains(err.Error(), "STEP1") {
 			return Closed, nil
 		}

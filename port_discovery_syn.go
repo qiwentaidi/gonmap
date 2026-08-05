@@ -64,7 +64,7 @@ type synPendingProbe struct {
 }
 
 type synPacketSender interface {
-	sendTCP(remoteIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags uint8, window uint16) (net.IP, error)
+	sendTCP(ctx context.Context, remoteIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags uint8, window uint16) (net.IP, error)
 	close()
 }
 
@@ -82,19 +82,30 @@ type synDiscoveryScanner struct {
 	pending map[synProbeKey]synPendingProbe
 	open    map[string]OpenPort
 
-	writeMu sync.Mutex
-	done    chan struct{}
-	wg      sync.WaitGroup
+	writeMu  sync.Mutex
+	done     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
+	ctx      context.Context
 }
 
-func discoverOpenPortsSYN(hosts []string, ports []int, opts PortDiscoveryOptions) ([]OpenPort, error) {
-	hostIPs := resolveSYNDiscoveryHosts(hosts, opts.Timeout)
+func discoverOpenPortsSYN(ctx context.Context, hosts []string, ports []int, opts PortDiscoveryOptions) ([]OpenPort, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	hostIPs := resolveSYNDiscoveryHosts(ctx, hosts, opts.Timeout)
 	if len(hostIPs) == 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return nil, errSYNDiscoveryUnavailable
 	}
 
 	tasks := buildSYNScanTasks(hostIPs, ports)
 	if len(tasks) == 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return nil, errSYNDiscoveryUnavailable
 	}
 
@@ -104,7 +115,7 @@ func discoverOpenPortsSYN(hosts []string, ports []int, opts PortDiscoveryOptions
 	}
 	defer scanner.close()
 
-	err = scanner.scan(tasks)
+	err = scanner.scan(ctx, tasks)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +163,11 @@ func newSYNDiscoveryScanner(conn *ipv4.RawConn, sender synPacketSender, timeout 
 	}
 }
 
-func (s *synDiscoveryScanner) scan(tasks []synScanTask) error {
+func (s *synDiscoveryScanner) scan(ctx context.Context, tasks []synScanTask) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.ctx = ctx
 	if s.conn != nil {
 		s.wg.Add(1)
 		go func() {
@@ -167,6 +182,10 @@ func (s *synDiscoveryScanner) scan(tasks []synScanTask) error {
 			s.recvPCAP(handle)
 		}(handle)
 	}
+	defer func() {
+		s.stopReceivers()
+		s.wg.Wait()
+	}()
 
 	var firstErr error
 	sent := 0
@@ -179,9 +198,18 @@ func (s *synDiscoveryScanner) scan(tasks []synScanTask) error {
 	attemptsInWindow := 0
 
 	for _, task := range tasks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if attemptsInWindow >= burstSize {
 			if sleep := time.Until(nextWindow); sleep > 0 {
-				time.Sleep(sleep)
+				timer := time.NewTimer(sleep)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return ctx.Err()
+				case <-timer.C:
+				}
 			}
 			now := time.Now()
 			for !nextWindow.After(now) {
@@ -190,7 +218,7 @@ func (s *synDiscoveryScanner) scan(tasks []synScanTask) error {
 			attemptsInWindow = 0
 		}
 		attemptsInWindow++
-		if err := s.sendSYN(task); err != nil {
+		if err := s.sendSYN(ctx, task); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -199,28 +227,35 @@ func (s *synDiscoveryScanner) scan(tasks []synScanTask) error {
 		sent++
 	}
 	if sent == 0 {
-		s.stopReceivers()
-		s.wg.Wait()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if firstErr != nil {
 			return firstErr
 		}
 		return errSYNDiscoveryUnavailable
 	}
 
-	time.Sleep(s.timeout + 100*time.Millisecond)
-	s.stopReceivers()
-	s.wg.Wait()
+	timer := time.NewTimer(s.timeout + 100*time.Millisecond)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return ctx.Err()
+	case <-timer.C:
+	}
 	return nil
 }
 
 func (s *synDiscoveryScanner) stopReceivers() {
-	close(s.done)
-	if s.conn != nil {
-		_ = s.conn.SetReadDeadline(time.Now())
-	}
-	for _, handle := range s.pcap {
-		handle.Close()
-	}
+	s.stopOnce.Do(func() {
+		close(s.done)
+		if s.conn != nil {
+			_ = s.conn.SetReadDeadline(time.Now())
+		}
+		for _, handle := range s.pcap {
+			handle.Close()
+		}
+	})
 }
 
 func (s *synDiscoveryScanner) close() {
@@ -232,8 +267,11 @@ func (s *synDiscoveryScanner) close() {
 	}
 }
 
-func (s *synDiscoveryScanner) sendSYN(task synScanTask) error {
-	srcIP, err := s.localIPv4ForRemote(task.ip)
+func (s *synDiscoveryScanner) sendSYN(ctx context.Context, task synScanTask) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	srcIP, err := s.localIPv4ForRemote(ctx, task.ip)
 	if err != nil {
 		return err
 	}
@@ -255,7 +293,7 @@ func (s *synDiscoveryScanner) sendSYN(task synScanTask) error {
 
 	seq := uint32(s.randSource.Int31())
 	if s.packetSender != nil {
-		_, err = s.packetSender.sendTCP(task.ip, srcPort, dstPort, seq, 0, tcpFlagSYN, 64240)
+		_, err = s.packetSender.sendTCP(ctx, task.ip, srcPort, dstPort, seq, 0, tcpFlagSYN, 64240)
 	} else {
 		segment := buildTCPSegment(srcPort, dstPort, seq, 0, tcpFlagSYN, 64240, srcIP, task.ip)
 		header := &ipv4.Header{
@@ -279,12 +317,12 @@ func (s *synDiscoveryScanner) sendSYN(task synScanTask) error {
 	return nil
 }
 
-func (s *synDiscoveryScanner) localIPv4ForRemote(dst net.IP) (net.IP, error) {
+func (s *synDiscoveryScanner) localIPv4ForRemote(ctx context.Context, dst net.IP) (net.IP, error) {
 	key := dst.String()
 	if srcIP := s.srcIPCache[key]; srcIP != nil {
 		return srcIP, nil
 	}
-	srcIP, err := localIPv4ForRemote(dst, s.timeout)
+	srcIP, err := localIPv4ForRemote(ctx, dst, s.timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -363,9 +401,16 @@ func (s *synDiscoveryScanner) sendRST(localIP, remoteIP net.IP, localPort, remot
 	if localIP == nil || remoteIP == nil {
 		return nil
 	}
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if s.packetSender != nil {
-		_, err := s.packetSender.sendTCP(remoteIP, localPort, remotePort, remoteAck, remoteSeq+1, tcpFlagRST|tcpFlagACK, 0)
+		_, err := s.packetSender.sendTCP(ctx, remoteIP, localPort, remotePort, remoteAck, remoteSeq+1, tcpFlagRST|tcpFlagACK, 0)
 		return err
 	}
 
@@ -509,10 +554,13 @@ func (s *synDiscoveryScanner) openPorts() []OpenPort {
 	return openPorts
 }
 
-func resolveSYNDiscoveryHosts(hosts []string, timeout time.Duration) []struct {
+func resolveSYNDiscoveryHosts(ctx context.Context, hosts []string, timeout time.Duration) []struct {
 	host string
 	ip   net.IP
 } {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if timeout <= 0 {
 		timeout = defaultDiscoveryTimeout
 	}
@@ -527,6 +575,9 @@ func resolveSYNDiscoveryHosts(hosts []string, timeout time.Duration) []struct {
 	seen := make(map[string]struct{})
 
 	for _, host := range hosts {
+		if ctx.Err() != nil {
+			return resolved
+		}
 		if host == "" {
 			continue
 		}
@@ -546,8 +597,8 @@ func resolveSYNDiscoveryHosts(hosts []string, timeout time.Duration) []struct {
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		lookupCtx, cancel := context.WithTimeout(ctx, timeout)
+		addrs, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
 		cancel()
 		if err != nil {
 			continue
@@ -607,11 +658,15 @@ func buildSYNScanTasks(hostIPs []struct {
 	return tasks
 }
 
-func localIPv4ForRemote(dst net.IP, timeout time.Duration) (net.IP, error) {
+func localIPv4ForRemote(ctx context.Context, dst net.IP, timeout time.Duration) (net.IP, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if timeout <= 0 {
 		timeout = defaultDiscoveryTimeout
 	}
-	conn, err := net.DialTimeout("udp4", net.JoinHostPort(dst.String(), "80"), timeout)
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "udp4", net.JoinHostPort(dst.String(), "80"))
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,7 @@
 package gonmap
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -40,6 +41,52 @@ func TestDiscoverOpenPortsFindsListeningSocket(t *testing.T) {
 	}
 	if results[0].Host != "127.0.0.1" || results[0].Port != port {
 		t.Fatalf("unexpected result: %#v", results[0])
+	}
+}
+
+func TestDiscoverOpenPortsWithContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	results := DiscoverOpenPortsWithContext(ctx, []string{"127.0.0.1"}, ExpandPortRange(1, 65535), &PortDiscoveryOptions{
+		Timeout:     time.Second,
+		Concurrency: 64,
+	})
+
+	if len(results) != 0 {
+		t.Fatalf("expected no results after cancellation, got %#v", results)
+	}
+}
+
+type fakeSYNPacketSender struct{}
+
+func (fakeSYNPacketSender) sendTCP(ctx context.Context, remoteIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags uint8, window uint16) (net.IP, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return net.IPv4(127, 0, 0, 1), nil
+}
+
+func (fakeSYNPacketSender) close() {}
+
+func TestSYNDiscoveryScannerScanCancelsFinalWait(t *testing.T) {
+	scanner := newSYNDiscoveryScanner(nil, fakeSYNPacketSender{}, 5*time.Second, 1000)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	start := time.Now()
+	err := scanner.scan(ctx, []synScanTask{{
+		ip:    net.IPv4(127, 0, 0, 1),
+		port:  80,
+		hosts: []string{"127.0.0.1"},
+	}})
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("expected final wait to stop on cancellation, elapsed=%s", elapsed)
 	}
 }
 

@@ -1,6 +1,7 @@
 package gonmap
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -37,6 +38,13 @@ type probe struct {
 }
 
 func (p *probe) scan(host string, port int, tls bool, timeout time.Duration, size int, proxyURL string) (string, bool, error) {
+	return p.scanWithContext(context.Background(), host, port, tls, timeout, size, proxyURL)
+}
+
+func (p *probe) scanWithContext(ctx context.Context, host string, port int, tls bool, timeout time.Duration, size int, proxyURL string) (string, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	portText := strconv.Itoa(port)
 	uri := net.JoinHostPort(host, portText)
 
@@ -44,19 +52,19 @@ func (p *probe) scan(host string, port int, tls bool, timeout time.Duration, siz
 
 	switch sendRaw {
 	case "__KB_STARTUP__":
-		text, err := simplenet.SendPostgresStartup(uri, timeout, size, false, proxyURL)
+		text, err := simplenet.SendPostgresStartupWithContext(ctx, uri, timeout, size, false, proxyURL)
 		return text, false, err
 	case "__KB_STARTUP_SSL__":
-		text, err := simplenet.SendPostgresStartup(uri, timeout, size, true, proxyURL)
+		text, err := simplenet.SendPostgresStartupWithContext(ctx, uri, timeout, size, true, proxyURL)
 		return text, true, err
 	}
 
-	text, err := simplenet.Send(p.protocol, tls, uri, sendRaw, timeout, size, proxyURL)
+	text, err := simplenet.SendWithContext(ctx, p.protocol, tls, uri, sendRaw, timeout, size, proxyURL)
 	if err == nil {
 		return text, tls, nil
 	}
 	if strings.Contains(err.Error(), "STEP1") && tls {
-		text, err := simplenet.Send(p.protocol, false, uri, p.sendRaw, timeout, size, proxyURL)
+		text, err := simplenet.SendWithContext(ctx, p.protocol, false, uri, p.sendRaw, timeout, size, proxyURL)
 		return text, false, err
 	}
 	return text, tls, err

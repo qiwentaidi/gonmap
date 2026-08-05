@@ -2,6 +2,7 @@ package simplenet
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -43,6 +44,16 @@ var responseBufferPool = sync.Pool{
 }
 
 func readResponse(conn deadlineConn, size int, allowEarlyBreak bool) (string, error) {
+	return readResponseWithContext(context.Background(), conn, size, allowEarlyBreak)
+}
+
+func readResponseWithContext(ctx context.Context, conn deadlineConn, size int, allowEarlyBreak bool) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stopCancelMonitor := closeOnContextDone(ctx, conn)
+	defer stopCancelMonitor()
+
 	tmpPtr := readChunkPool.Get().(*[]byte)
 	tmp := *tmpPtr
 	defer readChunkPool.Put(tmpPtr)
@@ -55,6 +66,9 @@ func readResponse(conn deadlineConn, size int, allowEarlyBreak bool) (string, er
 	defer responseBufferPool.Put(buf)
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		length, err := conn.Read(tmp)
 		if length > 0 {
@@ -64,6 +78,9 @@ func readResponse(conn deadlineConn, size int, allowEarlyBreak bool) (string, er
 			break
 		}
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
 			if err == io.EOF {
 				break
 			}
@@ -80,6 +97,23 @@ func readResponse(conn deadlineConn, size int, allowEarlyBreak bool) (string, er
 	return buf.String(), nil
 }
 
+func closeOnContextDone(ctx context.Context, conn io.Closer) func() {
+	if ctx == nil || ctx.Err() != nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	return func() {
+		close(done)
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -89,25 +123,48 @@ func min(a, b int) int {
 
 // netloc 主机地址
 func tcpSend(protocol string, netloc string, data string, duration time.Duration, size int) (string, error) {
+	return tcpSendWithContext(context.Background(), protocol, netloc, data, duration, size)
+}
+
+func tcpSendWithContext(ctx context.Context, protocol string, netloc string, data string, duration time.Duration, size int) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	protocol = strings.ToLower(protocol)
-	conn, err := net.DialTimeout(protocol, netloc, duration)
+	dialer := &net.Dialer{Timeout: duration}
+	conn, err := dialer.DialContext(ctx, protocol, netloc)
 	if err != nil {
 		//fmt.Println(conn)
 		return "", errors.New(err.Error() + " STEP1:CONNECT")
 	}
 	defer conn.Close()
+	stopCancelMonitor := closeOnContextDone(ctx, conn)
+	defer stopCancelMonitor()
 	_, err = conn.Write([]byte(data))
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", errors.New(err.Error() + " STEP2:WRITE")
 	}
 	// 设计权衡：当读取量小于缓冲区时提前退出，以加快扫描速度。
 	// 这在大多数请求-响应协议中工作良好，但对分包传输可能截断响应。
-	return readResponse(conn, size, true)
+	return readResponseWithContext(ctx, conn, size, true)
 }
 
 func tcpSendWithProxy(protocol string, netloc string, data string, duration time.Duration, size int, socksAddress string, auth *proxy.Auth) (string, error) {
+	return tcpSendWithProxyContext(context.Background(), protocol, netloc, data, duration, size, socksAddress, auth)
+}
+
+func tcpSendWithProxyContext(ctx context.Context, protocol string, netloc string, data string, duration time.Duration, size int, socksAddress string, auth *proxy.Auth) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if socksAddress == "" {
 		return "", errors.New("socks address is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	dialer, err := proxy.SOCKS5("tcp", socksAddress, auth, &net.Dialer{
 		Timeout: duration,
@@ -122,15 +179,30 @@ func tcpSendWithProxy(protocol string, netloc string, data string, duration time
 		return "", errors.New(err.Error() + " STEP1:CONNECT")
 	}
 	defer conn.Close()
+	stopCancelMonitor := closeOnContextDone(ctx, conn)
+	defer stopCancelMonitor()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	_, err = conn.Write([]byte(data))
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", errors.New(err.Error() + " STEP2:WRITE")
 	}
-	return readResponse(conn, size, true)
+	return readResponseWithContext(ctx, conn, size, true)
 }
 
 // tlsSend函数用于发送TLS请求
 func tlsSend(protocol string, netloc string, data string, duration time.Duration, size int) (string, error) {
+	return tlsSendWithContext(context.Background(), protocol, netloc, data, duration, size)
+}
+
+func tlsSendWithContext(ctx context.Context, protocol string, netloc string, data string, duration time.Duration, size int) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// 将协议转换为小写
 	protocol = strings.ToLower(protocol)
 	// 创建TLS配置
@@ -144,23 +216,45 @@ func tlsSend(protocol string, netloc string, data string, duration time.Duration
 		Deadline: time.Now().Add(duration * 2),
 	}
 	// 使用网络拨号器和TLS配置建立连接
-	conn, err := tls.DialWithDialer(dialer, protocol, netloc, config)
+	rawConn, err := dialer.DialContext(ctx, protocol, netloc)
 	if err != nil {
 		return "", errors.New(err.Error() + " STEP1:CONNECT")
 	}
+	conn := tls.Client(rawConn, config)
 	defer conn.Close()
+	stopCancelMonitor := closeOnContextDone(ctx, conn)
+	defer stopCancelMonitor()
+	if err := conn.HandshakeContext(ctx); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		return "", errors.New(err.Error() + " STEP1:CONNECT")
+	}
 	// 向连接中写入数据
 	_, err = io.WriteString(conn, data)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", errors.New(err.Error() + " STEP2:WRITE")
 	}
 	// TLS 版本不使用 early break，因为 TLS 记录可能分多次到达。
-	return readResponse(conn, size, false)
+	return readResponseWithContext(ctx, conn, size, false)
 }
 
 func tlsSendWithProxy(protocol string, netloc string, data string, duration time.Duration, size int, socksAddress string, auth *proxy.Auth) (string, error) {
+	return tlsSendWithProxyContext(context.Background(), protocol, netloc, data, duration, size, socksAddress, auth)
+}
+
+func tlsSendWithProxyContext(ctx context.Context, protocol string, netloc string, data string, duration time.Duration, size int, socksAddress string, auth *proxy.Auth) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if socksAddress == "" {
 		return "", errors.New("socks address is empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 
 	// 创建 SOCKS5 代理 Dialer
@@ -177,6 +271,11 @@ func tlsSendWithProxy(protocol string, netloc string, data string, duration time
 		return "", fmt.Errorf("failed to connect to %s: %w", netloc, err)
 	}
 	defer rawConn.Close()
+	stopRawCancelMonitor := closeOnContextDone(ctx, rawConn)
+	defer stopRawCancelMonitor()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 
 	// 封装为 TLS 连接
 	tlsConn := tls.Client(rawConn, &tls.Config{
@@ -185,18 +284,26 @@ func tlsSendWithProxy(protocol string, netloc string, data string, duration time
 	})
 
 	// 执行 TLS 握手
-	err = tlsConn.Handshake()
+	err = tlsConn.HandshakeContext(ctx)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", fmt.Errorf("TLS handshake failed: %w", err)
 	}
 	defer tlsConn.Close()
+	stopTLSCancelMonitor := closeOnContextDone(ctx, tlsConn)
+	defer stopTLSCancelMonitor()
 
 	// 发送数据
 	_, err = tlsConn.Write([]byte(data))
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", fmt.Errorf("failed to send data: %w", err)
 	}
-	text, err := readResponse(tlsConn, size, false)
+	text, err := readResponseWithContext(ctx, tlsConn, size, false)
 	if err != nil {
 		return "", err
 	}
@@ -204,6 +311,13 @@ func tlsSendWithProxy(protocol string, netloc string, data string, duration time
 }
 
 func Send(protocol string, tls bool, netloc string, data string, duration time.Duration, size int, proxyURL string) (string, error) {
+	return SendWithContext(context.Background(), protocol, tls, netloc, data, duration, size, proxyURL)
+}
+
+func SendWithContext(ctx context.Context, protocol string, tls bool, netloc string, data string, duration time.Duration, size int, proxyURL string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	protocol = strings.ToLower(protocol)
 	if proxyURL != "" {
 		if protocol == "udp" {
@@ -220,22 +334,30 @@ func Send(protocol string, tls bool, netloc string, data string, duration time.D
 			auth = &proxy.Auth{User: username, Password: password}
 		}
 		if tls {
-			return tlsSendWithProxy(protocol, netloc, data, duration, size, u.Host, auth)
+			return tlsSendWithProxyContext(ctx, protocol, netloc, data, duration, size, u.Host, auth)
 		} else {
-			return tcpSendWithProxy(protocol, netloc, data, duration, size, u.Host, auth)
+			return tcpSendWithProxyContext(ctx, protocol, netloc, data, duration, size, u.Host, auth)
 		}
 	}
 	if tls {
-		return tlsSend(protocol, netloc, data, duration, size)
+		return tlsSendWithContext(ctx, protocol, netloc, data, duration, size)
 	} else {
-		return tcpSend(protocol, netloc, data, duration, size)
+		return tcpSendWithContext(ctx, protocol, netloc, data, duration, size)
 	}
 }
 
 func dialRaw(network, netloc string, duration time.Duration, proxyURL string) (net.Conn, error) {
+	return dialRawWithContext(context.Background(), network, netloc, duration, proxyURL)
+}
+
+func dialRawWithContext(ctx context.Context, network, netloc string, duration time.Duration, proxyURL string) (net.Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	network = strings.ToLower(network)
 	if proxyURL == "" {
-		conn, err := net.DialTimeout(network, netloc, duration)
+		dialer := &net.Dialer{Timeout: duration}
+		conn, err := dialer.DialContext(ctx, network, netloc)
 		if err != nil {
 			return nil, errors.New(err.Error() + " STEP1:CONNECT")
 		}
@@ -252,6 +374,9 @@ func dialRaw(network, netloc string, duration time.Duration, proxyURL string) (n
 		password, _ := u.User.Password()
 		auth = &proxy.Auth{User: username, Password: password}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	dialer, err := proxy.SOCKS5("tcp", u.Host, auth, &net.Dialer{Timeout: duration})
 	if err != nil {
 		return nil, err
@@ -259,6 +384,10 @@ func dialRaw(network, netloc string, duration time.Duration, proxyURL string) (n
 	conn, err := dialer.Dial(network, netloc)
 	if err != nil {
 		return nil, errors.New(err.Error() + " STEP1:CONNECT")
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 	return conn, nil
 }
@@ -292,22 +421,37 @@ func buildPostgresStartupPacket(user, database string) []byte {
 }
 
 func SendPostgresStartup(netloc string, duration time.Duration, size int, useSSL bool, proxyURL string) (string, error) {
-	conn, err := dialRaw("tcp", netloc, duration, proxyURL)
+	return SendPostgresStartupWithContext(context.Background(), netloc, duration, size, useSSL, proxyURL)
+}
+
+func SendPostgresStartupWithContext(ctx context.Context, netloc string, duration time.Duration, size int, useSSL bool, proxyURL string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn, err := dialRawWithContext(ctx, "tcp", netloc, duration, proxyURL)
 	if err != nil {
 		return "", err
 	}
 	defer conn.Close()
+	stopCancelMonitor := closeOnContextDone(ctx, conn)
+	defer stopCancelMonitor()
 
 	var rw deadlineConn = conn.(deadlineConn)
 	if useSSL {
 		sslReq := []byte{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}
 		if _, err := conn.Write(sslReq); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
 			return "", errors.New(err.Error() + " PGSTEP2:WRITE")
 		}
 
 		reply := make([]byte, 1)
 		_ = conn.SetReadDeadline(time.Now().Add(duration))
 		if _, err := io.ReadFull(conn, reply); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
 			return "", errors.New(err.Error() + " PGSTEP2:SSLNEGOTIATE")
 		}
 		if reply[0] != 'S' {
@@ -319,7 +463,10 @@ func SendPostgresStartup(netloc string, duration time.Duration, size int, useSSL
 			MinVersion:         tls.VersionTLS10,
 			ServerName:         splitNetlocHost(netloc),
 		})
-		if err := tlsConn.Handshake(); err != nil {
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
 			return "", errors.New(err.Error() + " PGSTEP2:TLSHANDSHAKE")
 		}
 		rw = tlsConn
@@ -327,11 +474,14 @@ func SendPostgresStartup(netloc string, duration time.Duration, size int, useSSL
 
 	startup := buildPostgresStartupPacket("system", "system")
 	if _, err := rw.Write(startup); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", errors.New(err.Error() + " PGSTEP2:WRITE")
 	}
 
 	// Startup/auth responses often arrive as a single frame while the server keeps
 	// the connection open for the next authentication step, so we should return
 	// after the first short read instead of waiting for EOF.
-	return readResponse(rw, size, true)
+	return readResponseWithContext(ctx, rw, size, true)
 }

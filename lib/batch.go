@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"sync"
@@ -99,7 +100,11 @@ func normalizeBatchScanOptions(options *BatchScanOptions) normalizedBatchScanOpt
 }
 
 func (s *SDK) ScanHostPorts(host string, ports []int, options *BatchScanOptions) *HostBatchResult {
-	results := s.ScanHostsPorts([]string{host}, ports, options)
+	return s.ScanHostPortsWithContext(context.Background(), host, ports, options)
+}
+
+func (s *SDK) ScanHostPortsWithContext(ctx context.Context, host string, ports []int, options *BatchScanOptions) *HostBatchResult {
+	results := s.ScanHostsPortsWithContext(ctx, []string{host}, ports, options)
 	if len(results) == 0 {
 		return &HostBatchResult{Host: host}
 	}
@@ -107,18 +112,28 @@ func (s *SDK) ScanHostPorts(host string, ports []int, options *BatchScanOptions)
 }
 
 func (s *SDK) ScanHostsPorts(hosts []string, ports []int, options *BatchScanOptions) []HostBatchResult {
+	return s.ScanHostsPortsWithContext(context.Background(), hosts, ports, options)
+}
+
+func (s *SDK) ScanHostsPortsWithContext(ctx context.Context, hosts []string, ports []int, options *BatchScanOptions) []HostBatchResult {
 	if len(hosts) == 0 {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	normalized := normalizeBatchScanOptions(options)
-	openPorts := s.DiscoverOpenPorts(hosts, ports, &normalized.discoveryOptions)
+	openPorts := s.DiscoverOpenPortsWithContext(ctx, hosts, ports, &normalized.discoveryOptions)
+	if ctx.Err() != nil {
+		return buildEmptyHostBatchResults(hosts)
+	}
 	groupedOpen := make(map[string][]int, len(hosts))
 	for _, item := range openPorts {
 		groupedOpen[item.Host] = append(groupedOpen[item.Host], item.Port)
 	}
 
-	groupedResults := s.identifyOpenPorts(groupedOpen, normalized)
+	groupedResults := s.identifyOpenPorts(ctx, groupedOpen, normalized)
 
 	hostResults := make([]HostBatchResult, 0, len(hosts))
 	for _, host := range hosts {
@@ -126,6 +141,14 @@ func (s *SDK) ScanHostsPorts(hosts []string, ports []int, options *BatchScanOpti
 		sort.Ints(openForHost)
 		result := analyzeHostBatchResult(host, openForHost, groupedResults[host], normalized)
 		hostResults = append(hostResults, result)
+	}
+	return hostResults
+}
+
+func buildEmptyHostBatchResults(hosts []string) []HostBatchResult {
+	hostResults := make([]HostBatchResult, 0, len(hosts))
+	for _, host := range hosts {
+		hostResults = append(hostResults, HostBatchResult{Host: host})
 	}
 	return hostResults
 }
@@ -144,10 +167,13 @@ func AnalyzeHostResults(host string, openPorts []int, results []BatchPortResult,
 	return analyzeHostBatchResult(host, copyOpenPorts, copyResults, normalized)
 }
 
-func (s *SDK) identifyOpenPorts(groupedOpen map[string][]int, options normalizedBatchScanOptions) map[string][]BatchPortResult {
+func (s *SDK) identifyOpenPorts(ctx context.Context, groupedOpen map[string][]int, options normalizedBatchScanOptions) map[string][]BatchPortResult {
 	type job struct {
 		host string
 		port int
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	resultsByHost := make(map[string][]BatchPortResult, len(groupedOpen))
@@ -159,22 +185,41 @@ func (s *SDK) identifyOpenPorts(groupedOpen map[string][]int, options normalized
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for item := range jobs {
-				status, response := s.Scan(item.host, item.port, &options.fingerprintOptions)
-				mu.Lock()
-				resultsByHost[item.host] = append(resultsByHost[item.host], BatchPortResult{
-					Port:     item.port,
-					Status:   status,
-					Response: response,
-				})
-				mu.Unlock()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case item, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if ctx.Err() != nil {
+						return
+					}
+					status, response := s.ScanWithContext(ctx, item.host, item.port, &options.fingerprintOptions)
+					if ctx.Err() != nil {
+						return
+					}
+					mu.Lock()
+					resultsByHost[item.host] = append(resultsByHost[item.host], BatchPortResult{
+						Port:     item.port,
+						Status:   status,
+						Response: response,
+					})
+					mu.Unlock()
+				}
 			}
 		}()
 	}
 
+producer:
 	for host, ports := range groupedOpen {
 		for _, port := range ports {
-			jobs <- job{host: host, port: port}
+			select {
+			case <-ctx.Done():
+				break producer
+			case jobs <- job{host: host, port: port}:
+			}
 		}
 	}
 	close(jobs)

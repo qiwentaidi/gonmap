@@ -3,6 +3,7 @@
 package gonmap
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -48,8 +49,14 @@ func newSYNLayer2PacketSender(timeout time.Duration) (synPacketSender, error) {
 	}, nil
 }
 
-func (s *synLayer2PacketSender) sendTCP(remoteIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags uint8, window uint16) (net.IP, error) {
-	route, err := s.routeForRemote(remoteIP)
+func (s *synLayer2PacketSender) sendTCP(ctx context.Context, remoteIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags uint8, window uint16) (net.IP, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	route, err := s.routeForRemote(ctx, remoteIP)
 	if err != nil {
 		return nil, err
 	}
@@ -91,6 +98,10 @@ func (s *synLayer2PacketSender) sendTCP(remoteIP net.IP, srcPort, dstPort uint16
 	}
 
 	s.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
 	err = route.handle.WritePacketData(buf.Bytes())
 	s.mu.Unlock()
 	if err != nil {
@@ -99,10 +110,13 @@ func (s *synLayer2PacketSender) sendTCP(remoteIP net.IP, srcPort, dstPort uint16
 	return route.srcIP, nil
 }
 
-func (s *synLayer2PacketSender) routeForRemote(remoteIP net.IP) (*synLayer2Route, error) {
+func (s *synLayer2PacketSender) routeForRemote(ctx context.Context, remoteIP net.IP) (*synLayer2Route, error) {
 	remoteIP = remoteIP.To4()
 	if remoteIP == nil {
 		return nil, errSYNDiscoveryUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	key := remoteIP.String()
@@ -113,8 +127,11 @@ func (s *synLayer2PacketSender) routeForRemote(remoteIP net.IP) (*synLayer2Route
 	}
 	s.mu.Unlock()
 
-	srcIP, err := localIPv4ForRemote(remoteIP, s.timeout)
+	srcIP, err := localIPv4ForRemote(ctx, remoteIP, s.timeout)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -140,7 +157,7 @@ func (s *synLayer2PacketSender) routeForRemote(remoteIP net.IP) (*synLayer2Route
 		}
 	}
 
-	dstMAC, err := resolveSYNLayer2MAC(device.Name, srcIP, srcMAC, nextHop, s.timeout)
+	dstMAC, err := resolveSYNLayer2MAC(ctx, device.Name, srcIP, srcMAC, nextHop, s.timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +279,10 @@ func pcapAddressContainsIPv4(address pcap.InterfaceAddress, ip net.IP) bool {
 	return base.Mask(address.Netmask).Equal(ip.Mask(address.Netmask))
 }
 
-func resolveSYNLayer2MAC(deviceName string, srcIP net.IP, srcMAC net.HardwareAddr, targetIP net.IP, timeout time.Duration) (net.HardwareAddr, error) {
+func resolveSYNLayer2MAC(ctx context.Context, deviceName string, srcIP net.IP, srcMAC net.HardwareAddr, targetIP net.IP, timeout time.Duration) (net.HardwareAddr, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	srcIP = srcIP.To4()
 	targetIP = targetIP.To4()
 	if srcIP == nil || targetIP == nil || len(srcMAC) == 0 {
@@ -290,6 +310,9 @@ func resolveSYNLayer2MAC(deviceName string, srcIP net.IP, srcMAC net.HardwareAdd
 	deadline := time.Now().Add(timeout)
 	nextSend := time.Time{}
 	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if time.Now().After(nextSend) {
 			if err := handle.WritePacketData(request); err != nil {
 				return nil, err

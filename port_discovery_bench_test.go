@@ -3,6 +3,7 @@
 package gonmap
 
 import (
+	"context"
 	"flag"
 	"testing"
 	"time"
@@ -42,7 +43,7 @@ func TestMeasureDiscoverySpeed(t *testing.T) {
 		err       error
 	)
 	if mode == PortDiscoveryModeSYN {
-		openPorts, err = discoverOpenPortsSYN([]string{*benchTarget}, ports, *options)
+		openPorts, err = discoverOpenPortsSYN(context.Background(), []string{*benchTarget}, ports, *options)
 		if err != nil {
 			t.Fatalf("syn discovery failed: %v", err)
 		}

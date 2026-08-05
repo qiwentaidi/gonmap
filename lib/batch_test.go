@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"testing"
@@ -63,6 +64,56 @@ func TestScanHostPortsDiscoversAndIdentifiesHTTP(t *testing.T) {
 	}
 	if service := result.Results[0].Response.FingerPrint.Service; service != "http" {
 		t.Fatalf("expected http service, got %q", service)
+	}
+}
+
+func TestScanHostPortsWithContextCancelsFingerprint(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer listener.Close()
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				select {
+				case <-done:
+				case <-time.After(10 * time.Second):
+				}
+			}(conn)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	time.AfterFunc(100*time.Millisecond, cancel)
+
+	port := listener.Addr().(*net.TCPAddr).Port
+	sdk := New(nil)
+	start := time.Now()
+	result := sdk.ScanHostPortsWithContext(ctx, "127.0.0.1", []int{port}, &BatchScanOptions{
+		DiscoveryOptions: PortDiscoveryOptions{
+			Timeout:     200 * time.Millisecond,
+			Concurrency: 4,
+		},
+		FingerprintOptions: ScanOptions{
+			Timeout:  5 * time.Second,
+			Protocol: ScanProtocolTCP,
+		},
+		FingerprintWorkers: 1,
+	})
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("expected cancellation before fingerprint timeout, elapsed=%s result=%#v", elapsed, result)
 	}
 }
 

@@ -1,6 +1,8 @@
 package gonmap
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -87,26 +89,39 @@ func ExpandPortRange(startPort, endPort int) []int {
 }
 
 func DiscoverOpenPorts(hosts []string, ports []int, options *PortDiscoveryOptions) []OpenPort {
+	return DiscoverOpenPortsWithContext(context.Background(), hosts, ports, options)
+}
+
+func DiscoverOpenPortsWithContext(ctx context.Context, hosts []string, ports []int, options *PortDiscoveryOptions) []OpenPort {
 	if len(hosts) == 0 || len(ports) == 0 {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	opts := normalizePortDiscoveryOptions(options)
 	if opts.Mode == PortDiscoveryModeSYN {
-		openPorts, err := discoverOpenPortsSYN(hosts, ports, opts)
+		openPorts, err := discoverOpenPortsSYN(ctx, hosts, ports, opts)
 		if err == nil {
 			return openPorts
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
 		}
 		fmt.Fprintf(os.Stderr, "syn discovery failed: %v\n", err)
 		return nil
 	}
-	return discoverOpenPortsConnect(hosts, ports, opts)
+	return discoverOpenPortsConnect(ctx, hosts, ports, opts)
 }
 
-func discoverOpenPortsConnect(hosts []string, ports []int, opts PortDiscoveryOptions) []OpenPort {
+func discoverOpenPortsConnect(ctx context.Context, hosts []string, ports []int, opts PortDiscoveryOptions) []OpenPort {
 	type job struct {
 		host string
 		port int
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	jobs := make(chan job, opts.Concurrency)
@@ -121,14 +136,29 @@ func discoverOpenPortsConnect(hosts []string, ports []int, opts PortDiscoveryOpt
 				Timeout:   opts.Timeout,
 				KeepAlive: -1,
 			}
-			for item := range jobs {
-				if !isValidPort(item.port) {
-					continue
-				}
-				if isTCPOpen(dialer, item.host, item.port) {
-					results <- OpenPort{
-						Host: item.host,
-						Port: item.port,
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case item, ok := <-jobs:
+					if !ok {
+						return
+					}
+					if ctx.Err() != nil {
+						return
+					}
+					if !isValidPort(item.port) {
+						continue
+					}
+					if isTCPOpen(ctx, dialer, item.host, item.port) {
+						select {
+						case results <- OpenPort{
+							Host: item.host,
+							Port: item.port,
+						}:
+						case <-ctx.Done():
+							return
+						}
 					}
 				}
 			}
@@ -136,15 +166,25 @@ func discoverOpenPortsConnect(hosts []string, ports []int, opts PortDiscoveryOpt
 	}
 
 	go func() {
+		defer close(jobs)
 		for _, host := range hosts {
+			if ctx.Err() != nil {
+				return
+			}
 			if host == "" {
 				continue
 			}
 			for _, port := range ports {
-				jobs <- job{host: host, port: port}
+				select {
+				case jobs <- job{host: host, port: port}:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
-		close(jobs)
+	}()
+
+	go func() {
 		wg.Wait()
 		close(results)
 	}()
@@ -164,8 +204,8 @@ func discoverOpenPortsConnect(hosts []string, ports []int, opts PortDiscoveryOpt
 	return openPorts
 }
 
-func isTCPOpen(dialer *net.Dialer, host string, port int) bool {
-	conn, err := dialer.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+func isTCPOpen(ctx context.Context, dialer *net.Dialer, host string, port int) bool {
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return false
 	}

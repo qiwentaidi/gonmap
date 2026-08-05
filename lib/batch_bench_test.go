@@ -3,6 +3,7 @@
 package lib
 
 import (
+	"context"
 	"flag"
 	"strconv"
 	"strings"
@@ -58,7 +59,7 @@ func TestMeasureBatchScanSpeed(t *testing.T) {
 		*benchBatchTarget: extractBenchPorts(openPorts, *benchBatchTarget),
 	}
 	fingerprintStart := time.Now()
-	groupedResults := sdk.identifyOpenPorts(groupedOpen, normalized)
+	groupedResults := sdk.identifyOpenPorts(context.Background(), groupedOpen, normalized)
 	fingerprintElapsed := time.Since(fingerprintStart)
 
 	result := AnalyzeHostResults(*benchBatchTarget, groupedOpen[*benchBatchTarget], groupedResults[*benchBatchTarget], options)

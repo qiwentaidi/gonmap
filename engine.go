@@ -1,6 +1,7 @@
 package gonmap
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -37,8 +38,12 @@ func (n *Nmap) Scan(ip string, port int, timeout time.Duration, proxyURL string)
 }
 
 func (n *Nmap) ScanWithOptions(ip string, port int, options *ScanOptions) (status Status, response *Response) {
+	return n.ScanWithOptionsContext(context.Background(), ip, port, options)
+}
+
+func (n *Nmap) ScanWithOptionsContext(ctx context.Context, ip string, port int, options *ScanOptions) (status Status, response *Response) {
 	scanOptions := n.normalizeScanOptions(options)
-	return newScanSession(n, ip, port, scanOptions).scan()
+	return newScanSessionWithContext(ctx, n, ip, port, scanOptions).scan()
 }
 
 func (n *Nmap) getFinger(responseRaw string, tls bool, requestName string) *FingerPrint {
@@ -228,6 +233,13 @@ func min(a, b int) int {
 
 // 工具函数
 func DnsScan(host string, port int) bool {
+	return DnsScanContext(context.Background(), host, port)
+}
+
+func DnsScanContext(ctx context.Context, host string, port int) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	domainServer := fmt.Sprintf("%s:%d", host, port)
 	c := dns.Client{
 		Timeout: 2 * time.Second,
@@ -235,7 +247,7 @@ func DnsScan(host string, port int) bool {
 	m := dns.Msg{}
 	// 最终都会指向一个ip 也就是typeA, 这样就可以返回所有层的cname.
 	m.SetQuestion("www.baidu.com.", dns.TypeA)
-	_, _, err := c.Exchange(&m, domainServer)
+	_, _, err := c.ExchangeContext(ctx, &m, domainServer)
 	if err == nil {
 		return true
 	} else {
