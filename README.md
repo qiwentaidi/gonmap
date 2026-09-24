@@ -320,6 +320,8 @@ fmt.Println("wrapped:", result.LikelyWrappedPorts)
 fmt.Println("likely_noise:", result.LikelyNoise, result.NoiseReason)
 ```
 
+批量入口会在发现开放端口时立即将其送入有界的指纹识别队列；发现与识别并行执行，最终返回值仍会等待两阶段完成并按端口排序。重复发现的同一主机端口只识别一次。直接调用 `DiscoverOpenPorts` 再逐个调用 `Scan` 的示例仍是分阶段执行。
+
 SYN 发现版本只需要替换 `DiscoveryOptions`：
 
 ```go

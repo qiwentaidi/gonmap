@@ -126,6 +126,10 @@ func (s *SDK) DiscoverOpenPortsWithContext(ctx context.Context, hosts []string, 
 	return gonmap.DiscoverOpenPortsWithContext(ctx, hosts, ports, options)
 }
 
+func (s *SDK) DiscoverOpenPortsWithContextCallback(ctx context.Context, hosts []string, ports []int, options *PortDiscoveryOptions, onOpen func(OpenPort)) []OpenPort {
+	return gonmap.DiscoverOpenPortsWithContextCallback(ctx, hosts, ports, options, onOpen)
+}
+
 func ExpandPortRange(startPort, endPort int) []int {
 	return gonmap.ExpandPortRange(startPort, endPort)
 }

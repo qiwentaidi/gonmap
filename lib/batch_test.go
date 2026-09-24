@@ -67,6 +67,45 @@ func TestScanHostPortsDiscoversAndIdentifiesHTTP(t *testing.T) {
 	}
 }
 
+func TestScanHostsPortsStartsFingerprintBeforeDiscoveryFinishes(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	fingerprintStarted := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			close(fingerprintStarted)
+			_ = conn.Close()
+		}
+	}()
+
+	item := OpenPort{Host: "127.0.0.1", Port: listener.Addr().(*net.TCPAddr).Port}
+	sdk := New(nil)
+	results := sdk.scanHostsPortsWithDiscovery(context.Background(), []string{item.Host}, []int{item.Port}, &BatchScanOptions{
+		FingerprintOptions: ScanOptions{Timeout: 200 * time.Millisecond, Protocol: ScanProtocolTCP, DisableFingerprint: true},
+		FingerprintWorkers: 1,
+	}, func(_ context.Context, _ []string, _ []int, _ *PortDiscoveryOptions, onOpen func(OpenPort)) []OpenPort {
+		onOpen(item)
+		onOpen(item)
+		select {
+		case <-fingerprintStarted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("fingerprint did not start while discovery was still running")
+		}
+		return []OpenPort{item, item}
+	})
+	if len(results) != 1 || len(results[0].OpenPorts) != 1 || results[0].OpenPorts[0] != item.Port {
+		t.Fatalf("unexpected open ports: %#v", results)
+	}
+	if len(results[0].Results) != 1 {
+		t.Fatalf("duplicate discovery should produce one fingerprint: %#v", results[0].Results)
+	}
+}
+
 func TestScanHostPortsWithContextCancelsFingerprint(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

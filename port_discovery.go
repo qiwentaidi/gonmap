@@ -93,6 +93,12 @@ func DiscoverOpenPorts(hosts []string, ports []int, options *PortDiscoveryOption
 }
 
 func DiscoverOpenPortsWithContext(ctx context.Context, hosts []string, ports []int, options *PortDiscoveryOptions) []OpenPort {
+	return DiscoverOpenPortsWithContextCallback(ctx, hosts, ports, options, nil)
+}
+
+// DiscoverOpenPortsWithContextCallback reports each open port as it is found.
+// The callback runs serially; a slow callback delays Connect discovery.
+func DiscoverOpenPortsWithContextCallback(ctx context.Context, hosts []string, ports []int, options *PortDiscoveryOptions, onOpen func(OpenPort)) []OpenPort {
 	if len(hosts) == 0 || len(ports) == 0 {
 		return nil
 	}
@@ -102,7 +108,7 @@ func DiscoverOpenPortsWithContext(ctx context.Context, hosts []string, ports []i
 
 	opts := normalizePortDiscoveryOptions(options)
 	if opts.Mode == PortDiscoveryModeSYN {
-		openPorts, err := discoverOpenPortsSYN(ctx, hosts, ports, opts)
+		openPorts, err := discoverOpenPortsSYNWithCallback(ctx, hosts, ports, opts, onOpen)
 		if err == nil {
 			return openPorts
 		}
@@ -112,10 +118,14 @@ func DiscoverOpenPortsWithContext(ctx context.Context, hosts []string, ports []i
 		fmt.Fprintf(os.Stderr, "syn discovery failed: %v\n", err)
 		return nil
 	}
-	return discoverOpenPortsConnect(ctx, hosts, ports, opts)
+	return discoverOpenPortsConnectWithCallback(ctx, hosts, ports, opts, onOpen)
 }
 
 func discoverOpenPortsConnect(ctx context.Context, hosts []string, ports []int, opts PortDiscoveryOptions) []OpenPort {
+	return discoverOpenPortsConnectWithCallback(ctx, hosts, ports, opts, nil)
+}
+
+func discoverOpenPortsConnectWithCallback(ctx context.Context, hosts []string, ports []int, opts PortDiscoveryOptions, onOpen func(OpenPort)) []OpenPort {
 	type job struct {
 		host string
 		port int
@@ -192,6 +202,9 @@ func discoverOpenPortsConnect(ctx context.Context, hosts []string, ports []int, 
 	openPorts := make([]OpenPort, 0, 16)
 	for result := range results {
 		openPorts = append(openPorts, result)
+		if onOpen != nil {
+			onOpen(result)
+		}
 	}
 
 	sort.Slice(openPorts, func(i, j int) bool {

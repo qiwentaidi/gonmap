@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,6 +42,72 @@ func TestDiscoverOpenPortsFindsListeningSocket(t *testing.T) {
 	}
 	if results[0].Host != "127.0.0.1" || results[0].Port != port {
 		t.Fatalf("unexpected result: %#v", results[0])
+	}
+}
+
+func TestDiscoverOpenPortsConnectReportsOpenPortBeforeReturn(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	var events []OpenPort
+	results := DiscoverOpenPortsWithContextCallback(context.Background(), []string{"127.0.0.1"}, []int{port}, &PortDiscoveryOptions{
+		Timeout: 200 * time.Millisecond, Concurrency: 1,
+	}, func(item OpenPort) {
+		events = append(events, item)
+	})
+	if len(events) != 1 || len(results) != 1 || events[0] != results[0] {
+		t.Fatalf("callback and returned ports differ: events=%#v results=%#v", events, results)
+	}
+}
+
+func TestSYNDiscoveryDispatchesOpenEventsWithoutBlockingReceiver(t *testing.T) {
+	scanner := &synDiscoveryScanner{
+		open:       make(map[string]OpenPort),
+		eventReady: make(chan struct{}, 1),
+	}
+	finished := make(chan struct{})
+	dispatchDone := make(chan struct{})
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	var callbackOnce sync.Once
+	var events []OpenPort
+	go func() {
+		defer close(dispatchDone)
+		scanner.dispatchOpenEvents(func(item OpenPort) {
+			callbackOnce.Do(func() { close(callbackEntered) })
+			<-releaseCallback
+			events = append(events, item)
+		}, finished)
+	}()
+
+	scanner.addOpenPorts(synPendingProbe{port: 80, hosts: []string{"127.0.0.1", "127.0.0.1"}})
+	select {
+	case <-callbackEntered:
+	case <-time.After(time.Second):
+		t.Fatal("SYN callback was not dispatched")
+	}
+	addDone := make(chan struct{})
+	go func() {
+		scanner.addOpenPorts(synPendingProbe{port: 443, hosts: []string{"127.0.0.1"}})
+		close(addDone)
+	}()
+	select {
+	case <-addDone:
+	case <-time.After(time.Second):
+		t.Fatal("slow callback blocked SYN receiver")
+	}
+	close(releaseCallback)
+	close(finished)
+	select {
+	case <-dispatchDone:
+	case <-time.After(time.Second):
+		t.Fatal("SYN event dispatcher did not finish")
+	}
+	if len(events) != 2 || events[0].Port != 80 || events[1].Port != 443 {
+		t.Fatalf("unexpected SYN events: %#v", events)
 	}
 }
 

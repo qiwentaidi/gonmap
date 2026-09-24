@@ -116,6 +116,10 @@ func (s *SDK) ScanHostsPorts(hosts []string, ports []int, options *BatchScanOpti
 }
 
 func (s *SDK) ScanHostsPortsWithContext(ctx context.Context, hosts []string, ports []int, options *BatchScanOptions) []HostBatchResult {
+	return s.scanHostsPortsWithDiscovery(ctx, hosts, ports, options, s.DiscoverOpenPortsWithContextCallback)
+}
+
+func (s *SDK) scanHostsPortsWithDiscovery(ctx context.Context, hosts []string, ports []int, options *BatchScanOptions, discover func(context.Context, []string, []int, *PortDiscoveryOptions, func(OpenPort)) []OpenPort) []HostBatchResult {
 	if len(hosts) == 0 {
 		return nil
 	}
@@ -124,16 +128,38 @@ func (s *SDK) ScanHostsPortsWithContext(ctx context.Context, hosts []string, por
 	}
 
 	normalized := normalizeBatchScanOptions(options)
-	openPorts := s.DiscoverOpenPortsWithContext(ctx, hosts, ports, &normalized.discoveryOptions)
-	if ctx.Err() != nil {
+	queue := newFingerprintQueue(ctx, s, normalized)
+	queued := make(map[OpenPort]struct{})
+	openPorts := discover(ctx, hosts, ports, &normalized.discoveryOptions, func(item OpenPort) {
+		if _, exists := queued[item]; exists {
+			return
+		}
+		queued[item] = struct{}{}
+		queue.enqueue(item)
+	})
+	discoveryCanceled := ctx.Err() != nil
+	groupedResults := queue.finish()
+	if discoveryCanceled {
 		return buildEmptyHostBatchResults(hosts)
 	}
 	groupedOpen := make(map[string][]int, len(hosts))
+	confirmed := make(map[OpenPort]struct{}, len(openPorts))
 	for _, item := range openPorts {
+		if _, exists := confirmed[item]; exists {
+			continue
+		}
+		confirmed[item] = struct{}{}
 		groupedOpen[item.Host] = append(groupedOpen[item.Host], item.Port)
 	}
-
-	groupedResults := s.identifyOpenPorts(ctx, groupedOpen, normalized)
+	for host, results := range groupedResults {
+		filtered := results[:0]
+		for _, result := range results {
+			if _, exists := confirmed[OpenPort{Host: host, Port: result.Port}]; exists {
+				filtered = append(filtered, result)
+			}
+		}
+		groupedResults[host] = filtered
+	}
 
 	hostResults := make([]HostBatchResult, 0, len(hosts))
 	for _, host := range hosts {
@@ -167,71 +193,87 @@ func AnalyzeHostResults(host string, openPorts []int, results []BatchPortResult,
 	return analyzeHostBatchResult(host, copyOpenPorts, copyResults, normalized)
 }
 
-func (s *SDK) identifyOpenPorts(ctx context.Context, groupedOpen map[string][]int, options normalizedBatchScanOptions) map[string][]BatchPortResult {
-	type job struct {
-		host string
-		port int
-	}
+type fingerprintQueue struct {
+	ctx     context.Context
+	jobs    chan OpenPort
+	mu      sync.Mutex
+	wg      sync.WaitGroup
+	results map[string][]BatchPortResult
+}
+
+func newFingerprintQueue(ctx context.Context, sdk *SDK, options normalizedBatchScanOptions) *fingerprintQueue {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-
-	resultsByHost := make(map[string][]BatchPortResult, len(groupedOpen))
-	var mu sync.Mutex
-	jobs := make(chan job, options.fingerprintWorkers)
-
-	var wg sync.WaitGroup
+	queue := &fingerprintQueue{
+		ctx:     ctx,
+		jobs:    make(chan OpenPort, options.fingerprintWorkers),
+		results: make(map[string][]BatchPortResult),
+	}
 	for i := 0; i < options.fingerprintWorkers; i++ {
-		wg.Add(1)
+		queue.wg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer queue.wg.Done()
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case item, ok := <-jobs:
+				case item, ok := <-queue.jobs:
 					if !ok {
 						return
 					}
 					if ctx.Err() != nil {
 						return
 					}
-					status, response := s.ScanWithContext(ctx, item.host, item.port, &options.fingerprintOptions)
+					status, response := sdk.ScanWithContext(ctx, item.Host, item.Port, &options.fingerprintOptions)
 					if ctx.Err() != nil {
 						return
 					}
-					mu.Lock()
-					resultsByHost[item.host] = append(resultsByHost[item.host], BatchPortResult{
-						Port:     item.port,
+					queue.mu.Lock()
+					queue.results[item.Host] = append(queue.results[item.Host], BatchPortResult{
+						Port:     item.Port,
 						Status:   status,
 						Response: response,
 					})
-					mu.Unlock()
+					queue.mu.Unlock()
 				}
 			}
 		}()
 	}
+	return queue
+}
 
+func (queue *fingerprintQueue) enqueue(item OpenPort) bool {
+	select {
+	case <-queue.ctx.Done():
+		return false
+	case queue.jobs <- item:
+		return true
+	}
+}
+
+func (queue *fingerprintQueue) finish() map[string][]BatchPortResult {
+	close(queue.jobs)
+	queue.wg.Wait()
+	for host := range queue.results {
+		sort.Slice(queue.results[host], func(i, j int) bool {
+			return queue.results[host][i].Port < queue.results[host][j].Port
+		})
+	}
+	return queue.results
+}
+
+func (s *SDK) identifyOpenPorts(ctx context.Context, groupedOpen map[string][]int, options normalizedBatchScanOptions) map[string][]BatchPortResult {
+	queue := newFingerprintQueue(ctx, s, options)
 producer:
 	for host, ports := range groupedOpen {
 		for _, port := range ports {
-			select {
-			case <-ctx.Done():
+			if !queue.enqueue(OpenPort{Host: host, Port: port}) {
 				break producer
-			case jobs <- job{host: host, port: port}:
 			}
 		}
 	}
-	close(jobs)
-	wg.Wait()
-
-	for host := range resultsByHost {
-		sort.Slice(resultsByHost[host], func(i, j int) bool {
-			return resultsByHost[host][i].Port < resultsByHost[host][j].Port
-		})
-	}
-
-	return resultsByHost
+	return queue.finish()
 }
 
 func analyzeHostBatchResult(host string, openPorts []int, results []BatchPortResult, options normalizedBatchScanOptions) HostBatchResult {

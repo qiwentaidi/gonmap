@@ -78,9 +78,11 @@ type synDiscoveryScanner struct {
 	randSource   *rand.Rand
 	srcIPCache   map[string]net.IP
 
-	mu      sync.Mutex
-	pending map[synProbeKey]synPendingProbe
-	open    map[string]OpenPort
+	mu         sync.Mutex
+	pending    map[synProbeKey]synPendingProbe
+	open       map[string]OpenPort
+	openEvents []OpenPort
+	eventReady chan struct{}
 
 	writeMu  sync.Mutex
 	done     chan struct{}
@@ -90,6 +92,10 @@ type synDiscoveryScanner struct {
 }
 
 func discoverOpenPortsSYN(ctx context.Context, hosts []string, ports []int, opts PortDiscoveryOptions) ([]OpenPort, error) {
+	return discoverOpenPortsSYNWithCallback(ctx, hosts, ports, opts, nil)
+}
+
+func discoverOpenPortsSYNWithCallback(ctx context.Context, hosts []string, ports []int, opts PortDiscoveryOptions, onOpen func(OpenPort)) ([]OpenPort, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -114,8 +120,23 @@ func discoverOpenPortsSYN(ctx context.Context, hosts []string, ports []int, opts
 		return nil, err
 	}
 	defer scanner.close()
+	var eventsDone chan struct{}
+	var eventsWG sync.WaitGroup
+	if onOpen != nil {
+		scanner.eventReady = make(chan struct{}, 1)
+		eventsDone = make(chan struct{})
+		eventsWG.Add(1)
+		go func() {
+			defer eventsWG.Done()
+			scanner.dispatchOpenEvents(onOpen, eventsDone)
+		}()
+	}
 
 	err = scanner.scan(ctx, tasks)
+	if onOpen != nil {
+		close(eventsDone)
+		eventsWG.Wait()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -537,9 +558,37 @@ func (s *synDiscoveryScanner) addOpenPorts(pending synPendingProbe) {
 		if _, exists := s.open[key]; exists {
 			continue
 		}
-		s.open[key] = OpenPort{
+		openPort := OpenPort{
 			Host: host,
 			Port: pending.port,
+		}
+		s.open[key] = openPort
+		if s.eventReady != nil {
+			s.openEvents = append(s.openEvents, openPort)
+			select {
+			case s.eventReady <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+func (s *synDiscoveryScanner) dispatchOpenEvents(onOpen func(OpenPort), finished <-chan struct{}) {
+	for {
+		s.mu.Lock()
+		batch := s.openEvents
+		s.openEvents = nil
+		s.mu.Unlock()
+		if len(batch) > 0 {
+			for _, openPort := range batch {
+				onOpen(openPort)
+			}
+			continue
+		}
+		select {
+		case <-s.eventReady:
+		case <-finished:
+			return
 		}
 	}
 }
