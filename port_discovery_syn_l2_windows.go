@@ -4,7 +4,6 @@ package gonmap
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -17,229 +16,58 @@ import (
 	netroute "github.com/libp2p/go-netroute"
 )
 
-type synLayer2PacketSender struct {
-	timeout time.Duration
-	opts    gopacket.SerializeOptions
-
-	mu     sync.Mutex
-	routes map[string]*synLayer2Route
-}
-
-type synLayer2Route struct {
-	handle *pcap.Handle
-	srcIP  net.IP
-	srcMAC net.HardwareAddr
-	dstMAC net.HardwareAddr
-}
-
 func newSYNLayer2PacketSender(timeout time.Duration) (synPacketSender, error) {
-	if timeout <= 0 {
-		timeout = defaultDiscoveryTimeout
-	}
-	if _, err := pcap.FindAllDevs(); err != nil {
-		return nil, err
-	}
-	return &synLayer2PacketSender{
-		timeout: timeout,
-		opts: gopacket.SerializeOptions{
-			FixLengths:       true,
-			ComputeChecksums: true,
-		},
-		routes: make(map[string]*synLayer2Route),
-	}, nil
-}
-
-func (s *synLayer2PacketSender) sendTCP(ctx context.Context, remoteIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags uint8, window uint16) (net.IP, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	route, err := s.routeForRemote(ctx, remoteIP)
-	if err != nil {
-		return nil, err
-	}
-
-	remoteIP = remoteIP.To4()
-	if remoteIP == nil {
-		return nil, errSYNDiscoveryUnavailable
-	}
-
-	eth := &layers.Ethernet{
-		SrcMAC:       route.srcMAC,
-		DstMAC:       route.dstMAC,
-		EthernetType: layers.EthernetTypeIPv4,
-	}
-	ip4 := &layers.IPv4{
-		Version:  4,
-		TTL:      64,
-		Id:       uint16(time.Now().UnixNano()),
-		Flags:    layers.IPv4DontFragment,
-		Protocol: layers.IPProtocolTCP,
-		SrcIP:    route.srcIP,
-		DstIP:    remoteIP,
-	}
-	tcp := &layers.TCP{
-		SrcPort: layers.TCPPort(srcPort),
-		DstPort: layers.TCPPort(dstPort),
-		Seq:     seq,
-		Ack:     ack,
-		Window:  window,
-		SYN:     flags&tcpFlagSYN != 0,
-		ACK:     flags&tcpFlagACK != 0,
-		RST:     flags&tcpFlagRST != 0,
-	}
-	tcp.SetNetworkLayerForChecksum(ip4)
-
-	buf := gopacket.NewSerializeBuffer()
-	if err := gopacket.SerializeLayers(buf, s.opts, eth, ip4, tcp); err != nil {
-		return nil, err
-	}
-
-	s.mu.Lock()
-	if err := ctx.Err(); err != nil {
-		s.mu.Unlock()
-		return nil, err
-	}
-	err = route.handle.WritePacketData(buf.Bytes())
-	s.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	return route.srcIP, nil
-}
-
-func (s *synLayer2PacketSender) routeForRemote(ctx context.Context, remoteIP net.IP) (*synLayer2Route, error) {
-	remoteIP = remoteIP.To4()
-	if remoteIP == nil {
-		return nil, errSYNDiscoveryUnavailable
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	key := remoteIP.String()
-	s.mu.Lock()
-	if route := s.routes[key]; route != nil {
-		s.mu.Unlock()
-		return route, nil
-	}
-	s.mu.Unlock()
-
-	srcIP, err := localIPv4ForRemote(ctx, remoteIP, s.timeout)
-	if err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	device, address, err := synPCAPDeviceForIPv4(srcIP)
-	if err != nil {
-		return nil, err
-	}
-
-	srcMAC, err := localHardwareAddrForIPv4(srcIP)
-	if err != nil {
-		return nil, err
-	}
-
-	nextHop := remoteIP
-	if !pcapAddressContainsIPv4(address, remoteIP) {
-		nextHop, err = synRouteNextHopIPv4(remoteIP)
-		if err != nil {
-			return nil, err
-		}
-		nextHop = nextHop.To4()
-		if nextHop == nil {
-			return nil, errSYNDiscoveryUnavailable
-		}
-	}
-
-	dstMAC, err := resolveSYNLayer2MAC(ctx, device.Name, srcIP, srcMAC, nextHop, s.timeout)
-	if err != nil {
-		return nil, err
-	}
-
-	handle, err := pcap.OpenLive(device.Name, 65535, false, 100*time.Millisecond)
-	if err != nil {
-		return nil, err
-	}
-
-	route := &synLayer2Route{
-		handle: handle,
-		srcIP:  srcIP,
-		srcMAC: srcMAC,
-		dstMAC: dstMAC,
-	}
-
-	s.mu.Lock()
-	if existing := s.routes[key]; existing != nil {
-		s.mu.Unlock()
-		handle.Close()
-		return existing, nil
-	}
-	s.routes[key] = route
-	s.mu.Unlock()
-	return route, nil
-}
-
-func synRouteNextHopIPv4(remoteIP net.IP) (net.IP, error) {
-	remoteIP = remoteIP.To4()
-	if remoteIP == nil {
-		return nil, errSYNDiscoveryUnavailable
-	}
-
-	router, err := netroute.New()
-	if err == nil {
-		_, routeGateway, _, routeErr := router.Route(remoteIP)
-		if routeErr == nil {
-			if routeGateway == nil || routeGateway.To4() == nil || routeGateway.IsUnspecified() {
-				return remoteIP, nil
-			}
-			return routeGateway.To4(), nil
-		}
-	}
-
-	defaultGateway, err := gateway.DiscoverGateway()
-	if err != nil {
-		return nil, err
-	}
-	defaultGateway = defaultGateway.To4()
-	if defaultGateway == nil {
-		return nil, errSYNDiscoveryUnavailable
-	}
-	return defaultGateway, nil
-}
-
-func (s *synLayer2PacketSender) close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for key, route := range s.routes {
-		route.handle.Close()
-		delete(s.routes, key)
-	}
-}
-
-func synPCAPDeviceForIPv4(ip net.IP) (pcap.Interface, pcap.InterfaceAddress, error) {
-	ip = ip.To4()
-	if ip == nil {
-		return pcap.Interface{}, pcap.InterfaceAddress{}, errSYNDiscoveryUnavailable
-	}
-
 	devices, err := pcap.FindAllDevs()
 	if err != nil {
-		return pcap.Interface{}, pcap.InterfaceAddress{}, err
+		return nil, err
 	}
-	for _, device := range devices {
-		for _, address := range device.Addresses {
-			if address.IP.To4().Equal(ip) {
-				return device, address, nil
+	router, routeErr := netroute.New()
+	var routeMu sync.Mutex
+	fallbackGateway := newSYNGatewayLookup(gateway.DiscoverGateway)
+	return newSYNLayer2Sender(timeout, synL2Dependencies{
+		source: localIPv4ForRemote,
+		device: func(src net.IP) (synL2Interface, error) {
+			for _, device := range devices {
+				for _, addr := range device.Addresses {
+					if addr.IP.To4() != nil && addr.IP.Equal(src) {
+						mac, err := localHardwareAddrForIPv4(src)
+						if err != nil {
+							return synL2Interface{}, err
+						}
+						return synL2Interface{name: device.Name, mac: mac, network: &net.IPNet{IP: addr.IP, Mask: addr.Netmask}}, nil
+					}
+				}
 			}
-		}
-	}
-	return pcap.Interface{}, pcap.InterfaceAddress{}, fmt.Errorf("%w: no pcap device for %s", errSYNDiscoveryUnavailable, ip.String())
+			return synL2Interface{}, fmt.Errorf("%w: no pcap device for %s", errSYNDiscoveryUnavailable, src)
+		},
+		nextHop: func(ctx context.Context, remote net.IP) (net.IP, error) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			// Route() uses the per-round routing snapshot. Do not hold this
+			// lock while a fallback gateway lookup may block other workers.
+			if routeErr == nil {
+				routeMu.Lock()
+				_, hop, _, err := router.Route(remote)
+				routeMu.Unlock()
+				if err == nil {
+					if hop == nil || hop.IsUnspecified() {
+						return remote, nil
+					}
+					return hop.To4(), nil
+				}
+			}
+			return fallbackGateway(ctx)
+		},
+		resolve: resolveSYNLayer2MAC,
+		open: func(name string) (synWriteHandle, error) {
+			h, err := pcap.OpenLive(name, 65535, false, 100*time.Millisecond)
+			if err != nil {
+				return nil, err
+			}
+			return h, nil
+		},
+	}), nil
 }
 
 func localHardwareAddrForIPv4(ip net.IP) (net.HardwareAddr, error) {
@@ -270,18 +98,12 @@ func localHardwareAddrForIPv4(ip net.IP) (net.HardwareAddr, error) {
 	return nil, fmt.Errorf("%w: no local mac for %s", errSYNDiscoveryUnavailable, ip.String())
 }
 
-func pcapAddressContainsIPv4(address pcap.InterfaceAddress, ip net.IP) bool {
-	base := address.IP.To4()
-	ip = ip.To4()
-	if base == nil || ip == nil || address.Netmask == nil {
-		return false
-	}
-	return base.Mask(address.Netmask).Equal(ip.Mask(address.Netmask))
-}
-
 func resolveSYNLayer2MAC(ctx context.Context, deviceName string, srcIP net.IP, srcMAC net.HardwareAddr, targetIP net.IP, timeout time.Duration) (net.HardwareAddr, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	srcIP = srcIP.To4()
 	targetIP = targetIP.To4()
@@ -322,28 +144,15 @@ func resolveSYNLayer2MAC(ctx context.Context, deviceName string, srcIP net.IP, s
 
 		data, _, err := handle.ReadPacketData()
 		if err != nil {
-			if errors.Is(err, pcap.NextErrorTimeoutExpired) {
+			if err == pcap.NextErrorTimeoutExpired {
 				continue
 			}
-			continue
+			return nil, fmt.Errorf("SYN ARP read on %s: %w", deviceName, err)
 		}
 
-		packet := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.NoCopy)
-		arpLayer := packet.Layer(layers.LayerTypeARP)
-		if arpLayer == nil {
-			continue
+		if mac := synARPReplyMAC(data, srcIP, srcMAC, targetIP); mac != nil {
+			return mac, nil
 		}
-		arp, ok := arpLayer.(*layers.ARP)
-		if !ok || arp.Operation != layers.ARPReply {
-			continue
-		}
-		if !net.IP(arp.SourceProtAddress).To4().Equal(targetIP) {
-			continue
-		}
-		if len(arp.SourceHwAddress) == 0 {
-			continue
-		}
-		return net.HardwareAddr(append([]byte(nil), arp.SourceHwAddress...)), nil
 	}
 	return nil, fmt.Errorf("%w: timeout resolving mac for %s", errSYNDiscoveryUnavailable, targetIP.String())
 }

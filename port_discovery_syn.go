@@ -26,8 +26,10 @@ const (
 	tcpFlagRST = 0x04
 	tcpFlagACK = 0x10
 
-	synSourcePortMin = uint16(49000)
-	synSourcePortMax = uint16(58999)
+	synSourcePortMin          = uint16(49000)
+	synSourcePortMax          = uint16(58999)
+	maxSYNSendFailuresPerHost = 3
+	synProgressInterval       = 256
 )
 
 var errSYNDiscoveryUnavailable = errors.New("syn discovery unavailable")
@@ -69,14 +71,19 @@ type synPacketSender interface {
 }
 
 type synDiscoveryScanner struct {
-	conn         *ipv4.RawConn
-	packetSender synPacketSender
-	pcap         []*pcap.Handle
-	timeout      time.Duration
-	rate         int
-	nextPort     uint16
-	randSource   *rand.Rand
-	srcIPCache   map[string]net.IP
+	conn              *ipv4.RawConn
+	packetSender      synPacketSender
+	pcap              []*pcap.Handle
+	timeout           time.Duration
+	rate              int
+	nextPort          uint16
+	randSource        *rand.Rand
+	srcIPCache        map[string]net.IP
+	resolveSource     func(context.Context, net.IP, time.Duration) (net.IP, error)
+	onProgress        func(int, int)
+	onHostUnreachable func(string, error)
+	onDiagnostics     func(SYNDiscoveryDiagnostics)
+	diagnostics       SYNDiscoveryDiagnostics
 
 	mu         sync.Mutex
 	pending    map[synProbeKey]synPendingProbe
@@ -95,7 +102,15 @@ func discoverOpenPortsSYN(ctx context.Context, hosts []string, ports []int, opts
 	return discoverOpenPortsSYNWithCallback(ctx, hosts, ports, opts, nil)
 }
 
-func discoverOpenPortsSYNWithCallback(ctx context.Context, hosts []string, ports []int, opts PortDiscoveryOptions, onOpen func(OpenPort)) ([]OpenPort, error) {
+func discoverOpenPortsSYNWithCallback(ctx context.Context, hosts []string, ports []int, opts PortDiscoveryOptions, onOpen func(OpenPort)) (result []OpenPort, discoveryErr error) {
+	scanStarted := false
+	started := time.Now()
+	defer func() {
+		if !scanStarted && opts.OnSYNDiagnostics != nil && discoveryErr != nil {
+			opts.OnSYNDiagnostics(SYNDiscoveryDiagnostics{Elapsed: time.Since(started), Done: true, Error: discoveryErr.Error()})
+		}
+	}()
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -107,6 +122,9 @@ func discoverOpenPortsSYNWithCallback(ctx context.Context, hosts []string, ports
 		return nil, errSYNDiscoveryUnavailable
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	tasks := buildSYNScanTasks(hostIPs, ports)
 	if len(tasks) == 0 {
 		if err := ctx.Err(); err != nil {
@@ -115,11 +133,34 @@ func discoverOpenPortsSYNWithCallback(ctx context.Context, hosts []string, ports
 		return nil, errSYNDiscoveryUnavailable
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	scanner, err := newSYNDiscoveryScannerForPlatform(opts.Timeout, opts.Rate)
 	if err != nil {
 		return nil, err
 	}
-	defer scanner.close()
+	scanner.onProgress = opts.OnProgress
+	scanner.onHostUnreachable = opts.OnHostUnreachable
+	scanner.onDiagnostics = opts.OnSYNDiagnostics
+	scanStarted = true
+	if err := scanner.scanWithEvents(ctx, tasks, onOpen); err != nil {
+		return nil, err
+	}
+	return sortOpenPorts(scanner.openPorts()), nil
+}
+
+// Keep the callback barrier inside the discovery call. A cancellation arriving
+// while a result callback drains must not be turned into a successful result.
+func (scanner *synDiscoveryScanner) scanWithEvents(ctx context.Context, tasks []synScanTask, onOpen func(OpenPort)) (scanErr error) {
+	// Resource shutdown is part of the acknowledgement barrier. Cancellation
+	// may arrive while either a result callback or a native Close is blocked.
+	defer func() {
+		scanner.close()
+		if ctx != nil && ctx.Err() != nil {
+			scanErr = ctx.Err()
+		}
+	}()
 	var eventsDone chan struct{}
 	var eventsWG sync.WaitGroup
 	if onOpen != nil {
@@ -132,17 +173,12 @@ func discoverOpenPortsSYNWithCallback(ctx context.Context, hosts []string, ports
 		}()
 	}
 
-	err = scanner.scan(ctx, tasks)
+	err := scanner.scan(ctx, tasks)
 	if onOpen != nil {
 		close(eventsDone)
 		eventsWG.Wait()
 	}
-	if err != nil {
-		return nil, err
-	}
-
-	openPorts := scanner.openPorts()
-	return sortOpenPorts(openPorts), nil
+	return err
 }
 
 func newSYNDiscoveryScannerForPlatform(timeout time.Duration, rate int) (*synDiscoveryScanner, error) {
@@ -184,11 +220,48 @@ func newSYNDiscoveryScanner(conn *ipv4.RawConn, sender synPacketSender, timeout 
 	}
 }
 
-func (s *synDiscoveryScanner) scan(ctx context.Context, tasks []synScanTask) error {
+func (s *synDiscoveryScanner) scan(ctx context.Context, tasks []synScanTask) (scanErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	s.ctx = ctx
+	started := time.Now()
+	s.diagnostics = SYNDiscoveryDiagnostics{Total: len(tasks)}
+	reported := 0
+	lastReport := time.Now()
+	report := func(final bool) {
+		attempted := s.diagnostics.Sent + s.diagnostics.Skipped
+		if !final && attempted-reported < synProgressInterval && time.Since(lastReport) < 2*time.Second && attempted < len(tasks) {
+			return
+		}
+		if attempted != reported && s.onProgress != nil {
+			s.onProgress(attempted, len(tasks))
+		}
+		reported = attempted
+		lastReport = time.Now()
+		s.diagnostics.Attempted = attempted
+		s.diagnostics.Elapsed = time.Since(started)
+		s.diagnostics.Done = final
+		if scanErr != nil {
+			s.diagnostics.Error = scanErr.Error()
+		}
+		if sender, ok := s.packetSender.(interface {
+			timings() (time.Duration, time.Duration)
+		}); ok {
+			s.diagnostics.RouteDuration, s.diagnostics.WriteDuration = sender.timings()
+		}
+		if sender, ok := s.packetSender.(interface {
+			preparationDiagnostics() (time.Duration, int, int, int)
+		}); ok {
+			s.diagnostics.SourceDuration, s.diagnostics.NeighborAttempts, s.diagnostics.NeighborCacheHits, s.diagnostics.SendHandles = sender.preparationDiagnostics()
+		}
+		if s.onDiagnostics != nil {
+			s.onDiagnostics(s.diagnostics)
+		}
+	}
+	// Registered before receiver cleanup: the final snapshot includes shutdown time.
+	defer func() { report(true) }()
+	failedHosts := make(map[string]bool)
 	if s.conn != nil {
 		s.wg.Add(1)
 		go func() {
@@ -218,9 +291,46 @@ func (s *synDiscoveryScanner) scan(ctx context.Context, tasks []synScanTask) err
 	nextWindow := time.Now().Add(burstWindow)
 	attemptsInWindow := 0
 
-	for _, task := range tasks {
+	ready := newSYNReadyTasks(ctx, tasks, s.packetSender)
+	defer ready.stop()
+	for {
+		task, preparation, ok := ready.next(ctx)
+		if !ok {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			break
+		}
+		if preparation != nil {
+			s.diagnostics.PrepareDuration += preparation.elapsed
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if preparation.err != nil {
+				if firstErr == nil {
+					firstErr = preparation.err
+				}
+				s.diagnostics.PrepareFailures++
+				s.diagnostics.UnreachableHosts++
+				s.diagnostics.LastError = preparation.err.Error()
+				failedHosts[task.ip.String()] = true
+				if s.onHostUnreachable != nil {
+					for _, host := range task.hosts {
+						s.onHostUnreachable(host, preparation.err)
+					}
+				}
+			} else {
+				s.diagnostics.PreparedHosts++
+				s.srcIPCache[task.ip.String()] = preparation.src
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if failedHosts[task.ip.String()] {
+			s.diagnostics.Skipped++
+			report(false)
+			continue
 		}
 		if attemptsInWindow >= burstSize {
 			if sleep := time.Until(nextWindow); sleep > 0 {
@@ -239,14 +349,46 @@ func (s *synDiscoveryScanner) scan(ctx context.Context, tasks []synScanTask) err
 			attemptsInWindow = 0
 		}
 		attemptsInWindow++
-		if err := s.sendSYN(ctx, task); err != nil {
-			if firstErr == nil {
-				firstErr = err
+		var sendErr error
+		// Retry the SAME probe, so a transient failure does not silently lose its port.
+		// Prepared L2 routes never resolve in this loop; retries here are writes.
+		// Raw-IP source failures still perform real source lookups.
+		for retry := 0; retry < maxSYNSendFailuresPerHost; retry++ {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
+			sendStarted := time.Now()
+			sendErr = s.sendSYN(ctx, task)
+			s.diagnostics.SendDuration += time.Since(sendStarted)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if sendErr == nil {
+				break
+			}
+			s.diagnostics.Failed++
+			s.diagnostics.LastError = sendErr.Error()
+		}
+		if sendErr != nil {
+			if firstErr == nil {
+				firstErr = sendErr
+			}
+			failedHosts[task.ip.String()] = true
+			s.diagnostics.UnreachableHosts++
+			s.diagnostics.Skipped++
+			if s.onHostUnreachable != nil {
+				for _, host := range task.hosts {
+					s.onHostUnreachable(host, sendErr)
+				}
+			}
+			report(false)
 			continue
 		}
 		sent++
+		s.diagnostics.Sent++
+		report(false)
 	}
+
 	if sent == 0 {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -343,7 +485,13 @@ func (s *synDiscoveryScanner) localIPv4ForRemote(ctx context.Context, dst net.IP
 	if srcIP := s.srcIPCache[key]; srcIP != nil {
 		return srcIP, nil
 	}
-	srcIP, err := localIPv4ForRemote(ctx, dst, s.timeout)
+	lookup := s.resolveSource
+	if lookup == nil {
+		lookup = localIPv4ForRemote
+	}
+	started := time.Now()
+	srcIP, err := lookup(ctx, dst, s.timeout)
+	s.diagnostics.SourceDuration += time.Since(started)
 	if err != nil {
 		return nil, err
 	}
@@ -574,6 +722,7 @@ func (s *synDiscoveryScanner) addOpenPorts(pending synPendingProbe) {
 }
 
 func (s *synDiscoveryScanner) dispatchOpenEvents(onOpen func(OpenPort), finished <-chan struct{}) {
+	draining := false
 	for {
 		s.mu.Lock()
 		batch := s.openEvents
@@ -585,10 +734,15 @@ func (s *synDiscoveryScanner) dispatchOpenEvents(onOpen func(OpenPort), finished
 			}
 			continue
 		}
+		if draining {
+			return
+		}
 		select {
 		case <-s.eventReady:
 		case <-finished:
-			return
+			// Producers have exited, but an event may have arrived after the
+			// empty read above. Drain again even when finished wins select.
+			draining = true
 		}
 	}
 }

@@ -30,6 +30,15 @@ type PortDiscoveryOptions struct {
 	Concurrency int
 	Mode        PortDiscoveryMode
 	Rate        int
+
+	// SYN callbacks run synchronously on the discovery caller; keep them fast.
+	// Progress counts sent/skipped probes, NOT completed verification or a resume cursor.
+	OnProgress func(attempted, total int) `json:"-"`
+	// Called once per associated hostname after bounded preparation or send
+	// failure. Next-hop failures may be shared by several destinations after
+	// three real resolution attempts. This does not prove the host is offline.
+	OnHostUnreachable func(host string, err error)  `json:"-"`
+	OnSYNDiagnostics  func(SYNDiscoveryDiagnostics) `json:"-"`
 }
 
 type OpenPort struct {
@@ -45,6 +54,9 @@ func normalizePortDiscoveryOptions(options *PortDiscoveryOptions) PortDiscoveryO
 	if options == nil {
 		return normalized
 	}
+	normalized.OnProgress = options.OnProgress
+	normalized.OnHostUnreachable = options.OnHostUnreachable
+	normalized.OnSYNDiagnostics = options.OnSYNDiagnostics
 	if options.Timeout > 0 {
 		normalized.Timeout = options.Timeout
 	}
