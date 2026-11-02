@@ -493,3 +493,26 @@ sdk := lib.New(&lib.Options{
 	Protocol: lib.ScanProtocolTCP,
 })
 ```
+
+## IPv4 subnet sampling
+
+`DiscoverSubnetsWithContext(ctx, cidrs, options)` samples explicitly supplied IPv4
+CIDRs in /24 groups and returns `SubnetDiscoveryResult` records containing status,
+evidence host, TCP port, source and number of sampled hosts. The same API is
+available on `lib.SDK` and inherits its SOCKS5 proxy.
+
+```go
+opts := gonmap.DefaultSubnetDiscoveryOptions() // .1, .2, .254 + 2 stable random samples
+opts.TCP.Timeout = 3 * time.Second
+results, err := gonmap.DiscoverSubnetsWithContext(ctx, []string{"10.20.0.0/16"}, &opts)
+```
+
+Sampling stops at the first confirmed host in each group. `unconfirmed` is not
+proof of an offline network. Callers decide whether to skip unconfirmed networks
+or probe their remaining hosts for fuller coverage. A subnet hit does not admit
+all its hosts; use host discovery before full port scanning. Samples never leave
+the supplied prefixes, overlapping ranges are deduplicated, and the default
+131072-subnet limit bounds work before network activity. Cancellation joins all
+workers before returning. `AdditionalProbe` may supply a context-aware ICMP check;
+it is rejected with a proxy to prevent direct-network probes. Subnet result
+callbacks are serialized. This API does not depend on the Netspy executable.
