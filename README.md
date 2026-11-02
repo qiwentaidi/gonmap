@@ -135,6 +135,7 @@ status, resp := sdk.Scan("114.132.250.138", 80, &lib.ScanOptions{
 - `Concurrency`
 - `Mode`
 - `Rate`
+- `ProxyURL`：Connect 发现使用 SOCKS5 代理，SDK 默认继承 `lib.Options.ProxyURL`。SYN 不支持代理，也不会静默改成直连。
 
 ## 扫描协议
 
@@ -321,6 +322,73 @@ fmt.Println("likely_noise:", result.LikelyNoise, result.NoiseReason)
 ```
 
 批量入口会在发现开放端口时立即将其送入有界的指纹识别队列；发现与识别并行执行，最终返回值仍会等待两阶段完成并按端口排序。重复发现的同一主机端口只识别一次。直接调用 `DiscoverOpenPorts` 再逐个调用 `Scan` 的示例仍是分阶段执行。
+
+### TCP 启发式主机探测（可选）
+
+针对内网 `/24` 或更大的稀疏网段，可以先用少量常见 TCP 端口确认主机可达，再对命中的主机扫描完整端口范围。功能默认关闭；库不会根据目标数量自动开启。调用方仍负责展开 CIDR，传入单个 IP 或主机名。
+
+在批量扫描中设置非 nil 的 `HostDiscovery` 即可启用：
+
+```go
+results := sdk.ScanHostsPortsWithContext(ctx, hosts, lib.ExpandPortRange(1, 65535), &lib.BatchScanOptions{
+	HostDiscovery: &lib.HostDiscoveryOptions{
+		// Ports 省略时默认 80,443,22,3389,445。
+		Timeout:      time.Second,
+		Concurrency:  256, // 整个主机探测阶段的最大并发连接数
+		PortsPerHost: 5,
+	},
+	DiscoveryOptions: lib.PortDiscoveryOptions{
+		Mode:        lib.PortDiscoveryModeConnect,
+		Timeout:     time.Second,
+		Concurrency: 512,
+	},
+	FingerprintOptions: lib.ScanOptions{
+		Timeout:  3 * time.Second,
+		Protocol: lib.ScanProtocolTCP,
+	},
+})
+
+for _, result := range results {
+	if result.HostDiscovery != nil && result.HostDiscovery.Status != lib.HostConfirmed {
+		fmt.Println("跳过:", result.Host, result.HostDiscovery.Status, result.HostDiscovery.Error)
+		continue
+	}
+	fmt.Println("扫描结果:", result.Host, result.OpenPorts)
+}
+```
+
+行为约定：
+
+- 默认探测端口为 `80,443,22,3389,445`，可通过 `Ports` 替换。重复端口去重；非法端口或负数超时/并发参数报配置错误。`DefaultTCPHostDiscoveryPorts()` 返回独立副本。
+- 默认每次连接超时 1 秒、全局最多 256 个连接、每台主机最多 5 个并发探测。任一连接成功就取消该主机剩余探测，并等待其退出；只建立 TCP 连接，不发服务指纹探针。
+- `confirmed` 表示至少一个探测端口连接成功，`Port` 记录命中端口；完整扫描仍使用调用方配置的端口范围，不会自动增加五个探测端口作为扫描结果。
+- `unconfirmed` 表示未能确认存活，并不等于离线。仅开放其他端口、丢包或过滤都可能造成漏扫。需要完整覆盖时关闭该功能，或扩展探测端口。
+- `canceled` 表示探测因 context 取消/超时而未完成；`error` 表示批量入口配置错误，具体原因见 `Error`。批量返回值保留跳过主机及原因，顺序与首次出现的输入一致，去除空白和重复目标。
+- 主机探测完成后才生成完整扫描工作；取消探测会等待全部探测 worker 和连接结束，并阻止进入后续扫描。正式扫描阶段取消状态仍由调用方检查 `ctx.Err()`。
+- `HostDiscovery: nil` 保持原有主机准入行为。启用后支持后续 Connect 或直连 SYN 发现；不允许用 TCP 主机探测过滤显式 UDP 批量任务。
+- SDK 继承 `lib.Options.ProxyURL`。启用主机探测的批量任务中，主机探测、Connect 端口发现和指纹识别统一使用同一 SOCKS5 出口；任一阶段明确指定的代理覆盖 SDK 默认值，多个明确配置不一致时返回 `error`。代理与 SYN 同时配置也返回 `error`，不会回退直连。
+
+也可以单独使用探测 API，与调用方已有的 ICMP/Ping 存活结果合并，再执行扫描：
+
+```go
+probes, err := sdk.DiscoverLiveHostsWithContext(ctx, hostsNotConfirmedByPing, &lib.HostDiscoveryOptions{
+	Ports: []int{80, 443, 22, 3389, 445},
+	OnResult: func(result lib.HostDiscoveryResult) {
+		fmt.Println(result.Host, result.Status, result.Port)
+	},
+})
+if err != nil {
+	// 取消返回部分探测结果及 ctx.Err()；不要把未完成探测当作离线。
+	return err
+}
+for _, probe := range probes {
+	if probe.Status == lib.HostConfirmed {
+		// 与 Ping 已确认存活的主机取并集；合并后扫描时无需再次开启 HostDiscovery。
+	}
+}
+```
+
+根包同时提供 `gonmap.DiscoverLiveHosts` / `gonmap.DiscoverLiveHostsWithContext`。`OnResult` 串行回调已完成探测的主机，回调应快速返回；取消时尚未启动的主机仅出现在最终返回结果中。主机准入集合的持久化、任务暂停状态、断点恢复及 Agent 调度由调用方管理。
 
 SYN 发现版本只需要替换 `DiscoveryOptions`：
 

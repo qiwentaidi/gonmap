@@ -30,6 +30,8 @@ type PortDiscoveryOptions struct {
 	Concurrency int
 	Mode        PortDiscoveryMode
 	Rate        int
+	// ProxyURL is used for Connect discovery only. SYN cannot use a proxy.
+	ProxyURL string
 
 	// SYN callbacks run synchronously on the discovery caller; keep them fast.
 	// Progress counts sent/skipped probes, NOT completed verification or a resume cursor.
@@ -55,6 +57,7 @@ func normalizePortDiscoveryOptions(options *PortDiscoveryOptions) PortDiscoveryO
 		return normalized
 	}
 	normalized.OnProgress = options.OnProgress
+	normalized.ProxyURL = options.ProxyURL
 	normalized.OnHostUnreachable = options.OnHostUnreachable
 	normalized.OnSYNDiagnostics = options.OnSYNDiagnostics
 	if options.Timeout > 0 {
@@ -120,6 +123,10 @@ func DiscoverOpenPortsWithContextCallback(ctx context.Context, hosts []string, p
 
 	opts := normalizePortDiscoveryOptions(options)
 	if opts.Mode == PortDiscoveryModeSYN {
+		if opts.ProxyURL != "" {
+			fmt.Fprintln(os.Stderr, "syn discovery cannot use a proxy")
+			return nil
+		}
 		openPorts, err := discoverOpenPortsSYNWithCallback(ctx, hosts, ports, opts, onOpen)
 		if err == nil {
 			return openPorts
@@ -145,6 +152,11 @@ func discoverOpenPortsConnectWithCallback(ctx context.Context, hosts []string, p
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	dial, err := newTCPDiscoveryDialer(opts.ProxyURL, opts.Timeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "connect discovery configuration failed: %v\n", err)
+		return nil
+	}
 
 	jobs := make(chan job, opts.Concurrency)
 	results := make(chan OpenPort, opts.Concurrency)
@@ -154,10 +166,6 @@ func discoverOpenPortsConnectWithCallback(ctx context.Context, hosts []string, p
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			dialer := &net.Dialer{
-				Timeout:   opts.Timeout,
-				KeepAlive: -1,
-			}
 			for {
 				select {
 				case <-ctx.Done():
@@ -172,7 +180,7 @@ func discoverOpenPortsConnectWithCallback(ctx context.Context, hosts []string, p
 					if !isValidPort(item.port) {
 						continue
 					}
-					if isTCPOpen(ctx, dialer, item.host, item.port) {
+					if isTCPOpenWithDialer(ctx, dial, item.host, item.port) {
 						select {
 						case results <- OpenPort{
 							Host: item.host,
@@ -230,7 +238,11 @@ func discoverOpenPortsConnectWithCallback(ctx context.Context, hosts []string, p
 }
 
 func isTCPOpen(ctx context.Context, dialer *net.Dialer, host string, port int) bool {
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	return isTCPOpenWithDialer(ctx, dialer.DialContext, host, port)
+}
+
+func isTCPOpenWithDialer(ctx context.Context, dial tcpDialContext, host string, port int) bool {
+	conn, err := dial(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return false
 	}

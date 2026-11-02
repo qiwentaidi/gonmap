@@ -19,6 +19,8 @@ const (
 )
 
 type BatchScanOptions struct {
+	// HostDiscovery is opt-in. nil preserves scanning every supplied host.
+	HostDiscovery           *HostDiscoveryOptions
 	DiscoveryOptions        PortDiscoveryOptions
 	FingerprintOptions      ScanOptions
 	FingerprintWorkers      int
@@ -38,7 +40,9 @@ type BatchPortResult struct {
 }
 
 type HostBatchResult struct {
-	Host               string
+	Host string
+	// HostDiscovery records why a host was admitted or skipped; nil when disabled.
+	HostDiscovery      *HostDiscoveryResult
 	OpenPorts          []int
 	Results            []BatchPortResult
 	StablePorts        []int
@@ -83,6 +87,7 @@ func normalizeBatchScanOptions(options *BatchScanOptions) normalizedBatchScanOpt
 	if options.DiscoveryOptions.Rate > 0 {
 		normalized.discoveryOptions.Rate = options.DiscoveryOptions.Rate
 	}
+	normalized.discoveryOptions.ProxyURL = options.DiscoveryOptions.ProxyURL
 	normalized.fingerprintOptions = options.FingerprintOptions
 	if options.FingerprintWorkers > 0 {
 		normalized.fingerprintWorkers = options.FingerprintWorkers
@@ -116,6 +121,9 @@ func (s *SDK) ScanHostsPorts(hosts []string, ports []int, options *BatchScanOpti
 }
 
 func (s *SDK) ScanHostsPortsWithContext(ctx context.Context, hosts []string, ports []int, options *BatchScanOptions) []HostBatchResult {
+	if options != nil && options.HostDiscovery != nil {
+		return s.scanLiveHostsPorts(ctx, hosts, ports, options)
+	}
 	return s.scanHostsPortsWithDiscovery(ctx, hosts, ports, options, s.DiscoverOpenPortsWithContextCallback)
 }
 

@@ -15,6 +15,16 @@ type ScanProtocol = gonmap.ScanProtocol
 type PortDiscoveryOptions = gonmap.PortDiscoveryOptions
 type PortDiscoveryMode = gonmap.PortDiscoveryMode
 type OpenPort = gonmap.OpenPort
+type HostDiscoveryOptions = gonmap.HostDiscoveryOptions
+type HostDiscoveryResult = gonmap.HostDiscoveryResult
+type HostDiscoveryStatus = gonmap.HostDiscoveryStatus
+
+const (
+	HostConfirmed   = gonmap.HostConfirmed
+	HostUnconfirmed = gonmap.HostUnconfirmed
+	HostCanceled    = gonmap.HostCanceled
+	HostProbeError  = gonmap.HostProbeError
+)
 
 const (
 	ScanProtocolAuto = gonmap.ScanProtocolAuto
@@ -123,11 +133,37 @@ func (s *SDK) DiscoverOpenPorts(hosts []string, ports []int, options *PortDiscov
 }
 
 func (s *SDK) DiscoverOpenPortsWithContext(ctx context.Context, hosts []string, ports []int, options *PortDiscoveryOptions) []OpenPort {
-	return gonmap.DiscoverOpenPortsWithContext(ctx, hosts, ports, options)
+	return s.DiscoverOpenPortsWithContextCallback(ctx, hosts, ports, options, nil)
 }
 
 func (s *SDK) DiscoverOpenPortsWithContextCallback(ctx context.Context, hosts []string, ports []int, options *PortDiscoveryOptions, onOpen func(OpenPort)) []OpenPort {
-	return gonmap.DiscoverOpenPortsWithContextCallback(ctx, hosts, ports, options, onOpen)
+	merged := PortDiscoveryOptions{ProxyURL: s.defaultScanOptions.ProxyURL}
+	if options != nil {
+		merged = *options
+		if merged.ProxyURL == "" {
+			merged.ProxyURL = s.defaultScanOptions.ProxyURL
+		}
+	}
+	return gonmap.DiscoverOpenPortsWithContextCallback(ctx, hosts, ports, &merged, onOpen)
+}
+
+func DefaultTCPHostDiscoveryPorts() []int { return gonmap.DefaultTCPHostDiscoveryPorts() }
+
+func (s *SDK) DiscoverLiveHosts(hosts []string, options *HostDiscoveryOptions) ([]HostDiscoveryResult, error) {
+	return s.DiscoverLiveHostsWithContext(context.Background(), hosts, options)
+}
+
+// DiscoverLiveHostsWithContext inherits the SDK proxy, but uses its own short
+// discovery timeout rather than the service fingerprint timeout.
+func (s *SDK) DiscoverLiveHostsWithContext(ctx context.Context, hosts []string, options *HostDiscoveryOptions) ([]HostDiscoveryResult, error) {
+	merged := HostDiscoveryOptions{ProxyURL: s.defaultScanOptions.ProxyURL}
+	if options != nil {
+		merged = *options
+		if merged.ProxyURL == "" {
+			merged.ProxyURL = s.defaultScanOptions.ProxyURL
+		}
+	}
+	return gonmap.DiscoverLiveHostsWithContext(ctx, hosts, &merged)
 }
 
 func ExpandPortRange(startPort, endPort int) []int {
